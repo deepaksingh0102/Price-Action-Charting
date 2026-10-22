@@ -1375,7 +1375,16 @@ def render():
     dates = sorted(set(df1.index.date))
     df = df1[df1.index.normalize() == pd.Timestamp(dates[-1], tz=ET)]
     minutes = {"1 min": 1, "5 min": 5, "15 min": 15}[tf_label]
-    disp = add_indicators(resample(df, minutes))
+    # Indicators are computed on the FULL multi-day frame at the chosen bar
+    # size, then sliced to today — the analyzer's warm-up rule. Computing
+    # them on today's resampled bars alone starved the rolling indicators:
+    # a 5-min stochastic needed 14 x 5-min bars and stayed blank until
+    # 10:40 ET (1-min bars hid the same gap at 09:43). With prior sessions
+    # warming the window, the stochastic (and EMAs) are live from the open;
+    # VWAP still resets each session (it is grouped by date).
+    full_disp = add_indicators(resample(df1, minutes))
+    disp = full_disp[full_disp.index.normalize()
+                     == pd.Timestamp(dates[-1], tz=ET)]
     if len(disp) < 10:
         st.info("Only the first few bars of the session so far — the chart "
                 "builds as bars arrive.")
