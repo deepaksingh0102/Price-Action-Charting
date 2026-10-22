@@ -212,33 +212,37 @@ def swing_points(df: pd.DataFrame, w: int = 5) -> tuple[list[int], list[int]]:
 
 def sr_zones(df: pd.DataFrame, tol: float = ZONE_TOL) -> list[dict]:
     """Cluster swing-point prices into zones. Each zone: center, low, high,
-    touches (swing count), has_highs / has_lows (both => a flipped zone).
-    Only clusters with >= 2 touches qualify — the book's rule."""
+    touches (swing count), has_highs / has_lows, hi_idx / lo_idx (bar
+    positions of the tests — their order shows a flip: resistance tests
+    before support tests = the book's resistance-turned-support). Only
+    clusters with >= 2 touches qualify — the book's rule."""
     highs, lows = swing_points(df)
-    pts = [(float(df["High"].iloc[i]), "H") for i in highs]
-    pts += [(float(df["Low"].iloc[i]), "L") for i in lows]
+    pts = [(float(df["High"].iloc[i]), "H", i) for i in highs]
+    pts += [(float(df["Low"].iloc[i]), "L", i) for i in lows]
     if not pts:
         return []
     pts.sort()
     zones, cur = [], [pts[0]]
-    for p, kind in pts[1:]:
+    for p, kind, i in pts[1:]:
         if abs(p - cur[-1][0]) / max(cur[-1][0], 1e-9) <= tol:
-            cur.append((p, kind))
+            cur.append((p, kind, i))
         else:
             zones.append(cur)
-            cur = [(p, kind)]
+            cur = [(p, kind, i)]
     zones.append(cur)
     out = []
     for cl in zones:
         if len(cl) < 2:
             continue
-        prices = [p for p, _ in cl]
+        prices = [p for p, _, _ in cl]
         out.append({
             "center": float(np.median(prices)),
             "low": float(min(prices)), "high": float(max(prices)),
             "touches": len(cl),
-            "has_highs": any(k == "H" for _, k in cl),
-            "has_lows": any(k == "L" for _, k in cl),
+            "has_highs": any(k == "H" for _, k, _ in cl),
+            "has_lows": any(k == "L" for _, k, _ in cl),
+            "hi_idx": [i for _, k, i in cl if k == "H"],
+            "lo_idx": [i for _, k, i in cl if k == "L"],
         })
     return out
 
@@ -436,17 +440,32 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
                        key=lambda z: -z["center"])[:3]
         drawn_zones = above + below
         for z in drawn_zones:
-            role = "Resistance" if z["center"] >= price else "Support"
-            flipped = z["has_highs"] and z["has_lows"]
+            # The book's zone language: a zone above price, rejected >= 2
+            # times, is a SELLING ZONE (red). A zone below price is a
+            # BUYING ZONE (green) — an area price used to trade at and now
+            # trades above because demand stepped in; strongest when it is
+            # old resistance that flipped (resistance tests came before
+            # support tests in the cluster).
+            if z["center"] >= price:
+                label = f"SELLING ZONE x{z['touches']}"
+                flipped = (z["has_highs"] and z["has_lows"]
+                           and min(z["lo_idx"]) < max(z["hi_idx"]))
+                if flipped:
+                    label += " (flipped support)"
+                fill = "rgba(220, 38, 38, 0.10)"
+                line_c = "rgba(220, 38, 38, 0.45)"
+            else:
+                label = f"BUYING ZONE x{z['touches']}"
+                flipped = (z["has_highs"] and z["has_lows"]
+                           and min(z["hi_idx"]) < max(z["lo_idx"]))
+                if flipped:
+                    label += " (flipped resistance)"
+                fill = "rgba(22, 163, 74, 0.10)"
+                line_c = "rgba(22, 163, 74, 0.45)"
             fig.add_hrect(
                 y0=z["low"], y1=z["high"], row=1, col=1,
-                fillcolor=("rgba(220, 38, 38, 0.10)" if role == "Resistance"
-                           else "rgba(22, 163, 74, 0.10)"),
-                line=dict(color=("rgba(220, 38, 38, 0.45)" if role == "Resistance"
-                                 else "rgba(22, 163, 74, 0.45)"), width=1),
-                annotation_text=(f"{role} x{z['touches']}"
-                                 + (" (flipped)" if flipped else "")),
-                annotation_position="top right")
+                fillcolor=fill, line=dict(color=line_c, width=1),
+                annotation_text=label, annotation_position="top right")
 
     # Prior-day levels + opening range
     if pa:
@@ -661,8 +680,8 @@ def render():
     c1, c2, c3, c4 = st.columns(4)
     c1.metric(symbol, f"${float(last['Close']):,.2f}", f"{chg:+.2f}% vs prior close")
     c2.metric("Zones on chart",
-              f"{sum(1 for z in zones if z['center'] >= float(last['Close']))} R / "
-              f"{sum(1 for z in zones if z['center'] < float(last['Close']))} S")
+              f"{sum(1 for z in zones if z['center'] >= float(last['Close']))} selling / "
+              f"{sum(1 for z in zones if z['center'] < float(last['Close']))} buying")
     c3.metric("Stochastic %K / %D",
               f"{float(last['StochK']):.0f} / {float(last['StochD']):.0f}"
               if pd.notna(last["StochK"]) else "—")
@@ -704,10 +723,14 @@ else:
 
 with st.expander("How to read this chart"):
     st.markdown(
-        "- **Colored bands** — support (green) and resistance (red) zones: "
-        "prices where the stock has turned **2 or more times**. The book's "
-        "rule: a level only counts after repeated tests. A band marked "
-        "\"(flipped)\" has acted as both support and resistance.\n"
+        "- **Green BUYING ZONE / red SELLING ZONE bands** — the book's zones. "
+        "A **buying zone** (green, below price) is an area the stock used to "
+        "trade at and now trades above because demand stepped in — classically "
+        "old resistance that broke and turned into support (labeled \"flipped "
+        "resistance\"); the book uses the **bottom of the buying zone as the "
+        "stop**. A **selling zone** (red, above price) is a level sellers have "
+        "already **rejected 2 or more times** — the book's rule is not to buy "
+        "calls into it; only a breakout above it changes its role.\n"
         "- **Dotted trendlines** — through the two most recent swing "
         "highs/lows, kept only when tested at least twice. Price hitting the "
         "upper line is the book's selling area; the lower line, buying area.\n"
