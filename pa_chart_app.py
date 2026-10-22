@@ -36,6 +36,11 @@ import requests
 import streamlit as st
 from plotly.subplots import make_subplots
 
+try:
+    import yfinance as yf
+except Exception:  # PCR is an add-on; the app must still run without it
+    yf = None
+
 ET = ZoneInfo("America/New_York")
 ALPACA_BASE = "https://data.alpaca.markets/v2"
 LOAD_DAYS = 7            # calendar days of 1-min bars (covers ~5 sessions)
@@ -81,12 +86,15 @@ def alpaca_get(path: str, params: dict, tries: int = 4) -> dict:
     return {}
 
 
-def _bucket(live: bool, refresh_secs: int) -> int:
+def _bucket(live: bool, refresh_secs: int,
+            bucket_secs: int | None = None) -> int:
     """Time bucket (live tracking) + manual-refresh nonce — same scheme as
     the stock-analyzer's. The bucket is part of the fetch's cache key, so a
     new bucket (interval elapsed, or 🔄 Refresh now bumped the nonce) forces
-    a fresh Alpaca fetch; within a bucket the cached bars are reused."""
-    base = int(time.time() // refresh_secs) if live else 0
+    a fresh Alpaca fetch; within a bucket the cached bars are reused.
+    bucket_secs lets slow-moving data (PCR) refresh on its own slower
+    bucket instead of re-fetching every cycle."""
+    base = int(time.time() // (bucket_secs or refresh_secs)) if live else 0
     try:
         nonce = st.session_state.get("refresh_nonce", 0)
     except Exception:
@@ -385,6 +393,157 @@ def confluence(df: pd.DataFrame, zones: list[dict],
     return checks
 
 
+# ---------------------------------------------------------------- PCR
+# Zone bands exactly as the user specified (the sideways band is 0.9-1.1,
+# centered on PCR = 1):
+#   PCR < 0.7          Oversold zone — reversal on the cards
+#   0.7 <= PCR < 0.9   Bearish zone
+#   0.9 <= PCR <= 1.1  Sideways
+#   1.1 <  PCR <= 1.6  Bullish zone
+#   PCR > 1.6          Overbought zone — reversal on the cards
+PCR_BANDS = [(0.0, 0.7, "Oversold zone — reversal on the cards", "#d97706"),
+             (0.7, 0.9, "Bearish zone", "#dc2626"),
+             (0.9, 1.1, "Sideways", "#6b7280"),
+             (1.1, 1.6, "Bullish zone", "#16a34a"),
+             (1.6, 99.0, "Overbought zone — reversal on the cards", "#7c3aed")]
+
+
+def pcr_zone(pcr: float) -> tuple[str, str]:
+    for lo, hi, label, color in PCR_BANDS:
+        if lo <= pcr < hi or (label.startswith("Sideways") and pcr == hi) \
+                or (label.startswith("Bullish") and pcr == hi):
+            return label, color
+    return PCR_BANDS[-1][2], PCR_BANDS[-1][3]
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_pcr_alpaca(symbol: str, bucket: int = 0) -> dict | None:
+    """PCR from Alpaca options snapshots (data.alpaca.markets
+    /v1beta1/options/snapshots/{symbol}) — every contract's dailyBar volume
+    and openInterest, summed over expiries within ~60 days. Tries the OPRA
+    feed first, then the free indicative feed; entitlement decides which
+    answers. Returns the standard PCR dict plus 'source', or None."""
+    key, secret, _ = _secrets()
+    if not key or not secret:
+        return None
+    import re
+    headers = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
+    today = datetime.now(ET).date()
+    occ = re.compile(r"^[A-Z]+\d{6}([CP])\d{8}$")
+    for feed in ("opra", "indicative"):
+        try:
+            pv = cv = poi = coi = 0.0
+            token, pages = None, 0
+            while pages < 20:
+                params = {"feed": feed, "limit": 1000,
+                          "expiration_date_gte": today.isoformat(),
+                          "expiration_date_lte":
+                              (today + timedelta(days=60)).isoformat()}
+                if token:
+                    params["page_token"] = token
+                r = requests.get(
+                    "https://data.alpaca.markets/v1beta1/options"
+                    f"/snapshots/{symbol}", params=params, headers=headers,
+                    timeout=30)
+                if r.status_code in (401, 403):
+                    break  # not entitled to this feed — try the next one
+                r.raise_for_status()
+                data = r.json()
+                for csym, snap in (data.get("snapshots") or {}).items():
+                    m = occ.match(csym)
+                    if not m:
+                        continue
+                    vol = float((snap.get("dailyBar") or {}).get("v") or 0)
+                    oi = float(snap.get("openInterest") or 0)
+                    if m.group(1) == "P":
+                        pv += vol
+                        poi += oi
+                    else:
+                        cv += vol
+                        coi += oi
+                token = data.get("next_page_token")
+                pages += 1
+                if not token:
+                    break
+            if cv <= 0 and coi <= 0:
+                continue  # empty chain on this feed — try the next
+            pcr_vol = pv / cv if cv > 0 else None
+            pcr_oi = poi / coi if coi > 0 else None
+            src = f"Alpaca ({feed})"
+            if pcr_vol is not None:
+                return {"pcr": pcr_vol, "kind": "volume",
+                        "pcr_vol": pcr_vol, "pcr_oi": pcr_oi, "source": src}
+            if pcr_oi is not None:
+                return {"pcr": pcr_oi, "kind": "open interest",
+                        "pcr_vol": None, "pcr_oi": pcr_oi, "source": src}
+        except Exception:
+            continue
+    return None
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_pcr_yahoo(symbol: str, bucket: int = 0) -> dict | None:
+    """PCR from Yahoo's options chain (nearest 10 expiries) — the fallback
+    when Alpaca options data is unavailable. Same return shape."""
+    if yf is None:
+        return None
+    try:
+        t = yf.Ticker(symbol)
+        exps = list(t.options or [])[:10]
+        if not exps:
+            return None
+        pv = cv = poi = coi = 0.0
+        for e in exps:
+            ch = t.option_chain(e)
+            pv += float(ch.puts["volume"].fillna(0).sum())
+            cv += float(ch.calls["volume"].fillna(0).sum())
+            poi += float(ch.puts["openInterest"].fillna(0).sum())
+            coi += float(ch.calls["openInterest"].fillna(0).sum())
+        pcr_vol = pv / cv if cv > 0 else None
+        pcr_oi = poi / coi if coi > 0 else None
+        if pcr_vol is not None:
+            return {"pcr": pcr_vol, "kind": "volume",
+                    "pcr_vol": pcr_vol, "pcr_oi": pcr_oi, "source": "Yahoo"}
+        if pcr_oi is not None:
+            return {"pcr": pcr_oi, "kind": "open interest",
+                    "pcr_vol": None, "pcr_oi": pcr_oi, "source": "Yahoo"}
+        return None
+    except Exception:
+        return None
+
+
+def fetch_pcr(symbol: str, bucket: int = 0) -> dict | None:
+    """PCR with source preference: Alpaca first (the app's own data plane),
+    Yahoo as the fallback."""
+    return fetch_pcr_alpaca(symbol, bucket) or fetch_pcr_yahoo(symbol, bucket)
+
+
+def build_pcr_gauge(pcr: float) -> go.Figure:
+    """Horizontal band strip 0.3-2.0 with the five PCR zones colored and a
+    marker at the current PCR (clipped to the strip for display)."""
+    fig = go.Figure()
+    edges = [(0.3, 0.7), (0.7, 0.9), (0.9, 1.1), (1.1, 1.6), (1.6, 2.0)]
+    for (lo, hi), (_, _, label, color) in zip(edges, PCR_BANDS):
+        fig.add_trace(go.Bar(
+            x=[hi - lo], y=["PCR"], orientation="h", base=lo,
+            marker_color=color, opacity=0.75, hoverinfo="skip",
+            text=label.split(" — ")[0], textposition="inside",
+            insidetextanchor="middle",
+            textfont=dict(color="white", size=10), showlegend=False))
+    fig.add_trace(go.Scatter(
+        x=[min(max(pcr, 0.3), 2.0)], y=["PCR"], mode="markers",
+        marker=dict(symbol="triangle-down", size=16, color="black"),
+        hoverinfo="skip", showlegend=False))
+    fig.update_layout(
+        barmode="stack", height=110,
+        margin=dict(l=10, r=10, t=18, b=10),
+        title=dict(text=f"PCR {pcr:.2f}", font=dict(size=12), x=0.0),
+        xaxis=dict(range=[0.3, 2.0], tickvals=[0.7, 0.9, 1.0, 1.1, 1.6],
+                   ticktext=["0.7", "0.9", "1.0", "1.1", "1.6"],
+                   fixedrange=True),
+        yaxis=dict(visible=False, fixedrange=True),
+        dragmode=False)
+    return fig
 # ---------------------------------------------------------------- chart
 PHASES = [(570, 630, "Opening drive", "rgba(37, 99, 235, 0.05)"),
           (750, 780, "Midday", "rgba(107, 114, 128, 0.05)"),
@@ -697,6 +856,29 @@ def render():
                                 pa, orng, show, window_start=window_start),
                     use_container_width=True,
                     key=f"pa_{symbol}_{tf_label}_{chart_tf.replace(' ', '_')}")
+
+    # Put/Call Ratio strip (user's bands) — slow bucket: PCR does not need
+    # the fast refresh cycle, and the chain pull takes a few seconds.
+    p = fetch_pcr(symbol, _bucket(live, int(refresh_secs), bucket_secs=300))
+    if p is not None:
+        zlabel, _zcolor = pcr_zone(p["pcr"])
+        pc1, pc2 = st.columns([1, 3])
+        with pc1:
+            st.metric(f"Put/Call Ratio ({p['kind']})", f"{p['pcr']:.2f}")
+            st.markdown(f"**{zlabel}**")
+            oi_txt = (f" · PCR by open interest {p['pcr_oi']:.2f}"
+                      if p["pcr_oi"] is not None else "")
+            st.caption(f"Options chain via {p['source']} · nearest "
+                       f"expiries{oi_txt}")
+        with pc2:
+            st.plotly_chart(build_pcr_gauge(p["pcr"]),
+                            use_container_width=True, key=f"pcr_{symbol}")
+    elif yf is None:
+        st.caption("PCR unavailable — Alpaca options returned nothing and "
+                   "yfinance is not installed for this app (add it to "
+                   "requirements.txt and reboot).")
+    else:
+        st.caption(f"PCR unavailable for {symbol} — no options chain data.")
     if checks:
         st.markdown("**Confluence checklist** (the book's Premium stack, "
                     "at the last bar):")
@@ -745,4 +927,10 @@ with st.expander("How to read this chart"):
         "tend to start or exhaust.\n"
         "- **Stochastic (bottom)** — momentum shifts: blue %K crossing orange "
         "%D is the event; crossing up from under 20 or down from over 80 is "
-        "the one that matters, especially right at a level.")
+        "the one that matters, especially right at a level.\n"
+        "- **Put/Call Ratio strip** — options sentiment for the symbol "
+        "(by traded volume; the open-interest PCR is shown alongside). "
+        "Under 0.7 = oversold, reversal watch · 0.7–0.9 = bearish zone · "
+        "0.9–1.1 = sideways · 1.1–1.6 = bullish zone · over 1.6 = overbought, "
+        "reversal watch. Volume PCR builds during the session, so the first "
+        "hour's reading rests on thin volume.")
