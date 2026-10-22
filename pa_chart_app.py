@@ -397,7 +397,7 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
     price = float(df["Close"].iloc[-1])
     fig = make_subplots(
         rows=3, cols=1, shared_xaxes=True,
-        row_heights=[0.62, 0.12, 0.26], vertical_spacing=0.05,
+        row_heights=[0.66, 0.10, 0.24], vertical_spacing=0.05,
         subplot_titles=(f"{symbol} — price action", "Volume",
                         "Stochastic (momentum shift)"))
     x = df.index
@@ -428,12 +428,14 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
                     annotation_position="top left")
 
     # S/R zones: nearest 3 above + nearest 3 below the last price
+    drawn_zones: list[dict] = []
     if show.get("zones"):
         above = sorted([z for z in zones if z["center"] >= price],
                        key=lambda z: z["center"])[:3]
         below = sorted([z for z in zones if z["center"] < price],
                        key=lambda z: -z["center"])[:3]
-        for z in above + below:
+        drawn_zones = above + below
+        for z in drawn_zones:
             role = "Resistance" if z["center"] >= price else "Support"
             flipped = z["has_highs"] and z["has_lows"]
             fig.add_hrect(
@@ -486,6 +488,7 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
             if not group:
                 continue
             xs, ys, syms, cols, txts = [], [], [], [], []
+            last_labeled = -10
             for i, (name, bias) in group:
                 xs.append(x[i])
                 if bias == "bear":
@@ -500,7 +503,14 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
                     ys.append(float(df["High"].iloc[i]) * 1.001)
                     syms.append("diamond")
                     cols.append("#6b7280")
-                txts.append(name if labels else "")
+                # Label at most one formation per 4 bars — in a choppy open
+                # the labels otherwise stack into an unreadable blob. The
+                # markers themselves are always drawn.
+                if labels and i - last_labeled >= 4:
+                    txts.append(name)
+                    last_labeled = i
+                else:
+                    txts.append("")
             fig.add_trace(go.Scatter(
                 x=xs, y=ys, mode="markers+text" if labels else "markers",
                 text=txts, textposition="top center",
@@ -525,12 +535,36 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
                   annotation_text="Oversold 20", annotation_position="bottom left")
 
     fig.update_layout(
-        height=800, margin=dict(l=10, r=10, t=40, b=10),
+        height=950, margin=dict(l=10, r=10, t=40, b=10),
         xaxis_rangeslider_visible=False, hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.04, x=0))
     fig.update_yaxes(range=[0, 100], row=3, col=1)
     if window_start is not None:
         fig.update_xaxes(range=[window_start, df.index[-1]])
+
+    # Fit the price axis to the visible bars. The always-drawn level lines
+    # (PDH/PDC/PDL, far zones) otherwise stretch the axis on gap days and
+    # squash the candles into a sliver. A level extends the range only when
+    # it sits within one visible-range of the action (tested against the
+    # base range, so inclusions can't cascade); farther levels stay drawn
+    # but off-view until price approaches them.
+    vis = df[df.index >= window_start] if window_start is not None else df
+    if len(vis):
+        pad = 0.004 * price
+        base_lo = float(vis["Low"].min())
+        base_hi = float(vis["High"].max())
+        ylo, yhi = base_lo - pad, base_hi + pad
+        span = base_hi - base_lo
+        cands = [z["center"] for z in drawn_zones]
+        if pa:
+            cands += [pa["PDH"], pa["PDC"], pa["PDL"]]
+        if orng:
+            cands += [orng["high"], orng["low"]]
+        for v in cands:
+            if base_lo - span <= v <= base_hi + span:
+                ylo = min(ylo, v - pad * 0.5)
+                yhi = max(yhi, v + pad * 0.5)
+        fig.update_yaxes(range=[ylo, yhi], row=1, col=1)
     return fig
 
 
