@@ -47,6 +47,23 @@ except Exception:  # PCR is an add-on; the app must still run without it
 
 ET = ZoneInfo("America/New_York")
 ALPACA_BASE = "https://data.alpaca.markets/v2"
+
+# Version stamp: the footer shows this tag plus a hash computed live from
+# the deployed file itself, so the page proves which build is running —
+# compare it with the hash named when the file was delivered.
+BUILD_TAG = "2026-10-22"
+
+
+def _build_hash() -> str:
+    try:
+        import hashlib
+        from pathlib import Path
+        return hashlib.md5(Path(__file__).read_bytes()).hexdigest()[:6]
+    except Exception:
+        return "??????"
+
+
+BUILD_HASH = _build_hash()
 LOAD_DAYS = 7            # calendar days of 1-min bars (covers ~5 sessions)
 ZONE_TOL = 0.0015        # 0.15% — prices within this band are "the same level"
 LEVEL_TOL = 0.0020       # 0.20% — a bar is "at" a level within this band
@@ -1483,7 +1500,8 @@ def render():
         f"Alpaca {str(_feed).upper()} · {len(df1):,} 1-min bars loaded "
         f"({dates[0]} → {dates[-1]}) · showing {len(disp):,} {tf_label} bars "
         f"· window: {chart_tf} · "
-        f"updated {datetime.now(ET).strftime('%H:%M:%S')} ET")
+        f"updated {datetime.now(ET).strftime('%H:%M:%S')} ET · "
+        f"build {BUILD_TAG} · {BUILD_HASH}")
 
 
 if live and in_market_hours():
