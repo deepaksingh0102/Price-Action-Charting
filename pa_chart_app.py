@@ -42,6 +42,14 @@ LOAD_DAYS = 7            # calendar days of 1-min bars (covers ~5 sessions)
 ZONE_TOL = 0.0015        # 0.15% — prices within this band are "the same level"
 LEVEL_TOL = 0.0020       # 0.20% — a bar is "at" a level within this band
 
+# Sidebar "Chart timeframe" labels -> trailing minutes shown on the chart
+# (None = full session since market open) — same control as the
+# stock-analyzer's. It sets the visible window, not the bar size; zones,
+# trendlines and formations are computed on the full session.
+CHART_TF_TRAILING = {"5 minutes": 5, "15 minutes": 15, "1 hour": 60,
+                     "2 hours": 120, "3 hours": 180, "4 hours": 240,
+                     "Since market open": None}
+
 
 # ---------------------------------------------------------------- Alpaca
 def _secrets() -> tuple[str, str, str]:
@@ -368,7 +376,7 @@ PHASES = [(570, 630, "Opening drive", "rgba(37, 99, 235, 0.05)"),
 def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
                 lines: list[dict], pats: dict[int, tuple[str, str]],
                 levels: list[float], pa: dict | None, orng: dict | None,
-                show: dict) -> go.Figure:
+                show: dict, window_start=None) -> go.Figure:
     """3 panels: price (candles, EMA 9/21, VWAP, zones, trendlines, PDH/PDC/
     PDL, opening range, pattern markers, time-cycle phases), volume,
     stochastic."""
@@ -507,6 +515,8 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
         xaxis_rangeslider_visible=False, hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.04, x=0))
     fig.update_yaxes(range=[0, 100], row=3, col=1)
+    if window_start is not None:
+        fig.update_xaxes(range=[window_start, df.index[-1]])
     return fig
 
 
@@ -528,8 +538,14 @@ with st.sidebar:
     st.header("Chart")
     symbol = st.text_input("Stock symbol", value="AAPL").strip().upper() or "AAPL"
     tf_label = st.selectbox("Bar size", ["1 min", "5 min", "15 min"], index=0)
-    span_label = st.selectbox("Sessions shown",
-                              ["Today", "Last 3 sessions", "All loaded"], index=0)
+    chart_tf = st.selectbox(
+        "Chart timeframe",
+        ["5 minutes", "15 minutes", "1 hour", "2 hours", "3 hours",
+         "4 hours", "Since market open"],
+        index=6,
+        help="How much recent history the chart shows — same control as the "
+             "stock-analyzer's. Zones, trendlines and formations are "
+             "computed on the full session and stay drawn across the window.")
     st.header("Show")
     show = {
         "zones": st.checkbox("Support / resistance zones", value=True),
@@ -560,24 +576,16 @@ def render():
         st.info(f"Not enough intraday data for {symbol} yet.")
         return
     dates = sorted(set(df1.index.date))
-    if span_label == "Today":
-        keep = dates[-1:]
-    elif span_label == "Last 3 sessions":
-        keep = dates[-3:]
-    else:
-        keep = dates
-    df = df1[df1.index.normalize().isin(
-        [pd.Timestamp(d, tz=ET) for d in keep])]
+    df = df1[df1.index.normalize() == pd.Timestamp(dates[-1], tz=ET)]
     minutes = {"1 min": 1, "5 min": 5, "15 min": 15}[tf_label]
     disp = add_indicators(resample(df, minutes))
     if len(disp) < 30:
-        st.info("Not enough bars in this view yet — try a smaller bar size "
-                "or more sessions.")
+        st.info("Not enough bars in this view yet — try a smaller bar size.")
         return
 
     pa = prior_day_levels(df1)
     today_df = df1[df1.index.date == dates[-1]]
-    orng = opening_range(today_df) if span_label == "Today" else None
+    orng = opening_range(today_df)
     zones = sr_zones(disp)
     lines = trendlines(disp)
     pats = candle_patterns(disp)
@@ -600,10 +608,13 @@ def render():
     score = sum(1 for _, ok in checks if ok)
     c4.metric("Confluence (book stack)", f"{score} / {len(checks)}")
 
+    trailing = CHART_TF_TRAILING[chart_tf]
+    window_start = (disp.index[-1] - pd.Timedelta(minutes=trailing)
+                    if trailing is not None else None)
     st.plotly_chart(build_chart(disp, symbol, zones, lines, pats, level_vals,
-                                pa, orng, show),
+                                pa, orng, show, window_start=window_start),
                     use_container_width=True,
-                    key=f"pa_{symbol}_{tf_label}_{span_label}")
+                    key=f"pa_{symbol}_{tf_label}_{chart_tf.replace(' ', '_')}")
     if checks:
         st.markdown("**Confluence checklist** (the book's Premium stack, "
                     "at the last bar):")
@@ -611,7 +622,8 @@ def render():
             f"- {'✅' if ok else '⬜'} {label}" for label, ok in checks))
     st.caption(
         f"Alpaca {str(_feed).upper()} · {len(df1):,} 1-min bars loaded "
-        f"({dates[0]} → {dates[-1]}) · showing {len(disp):,} {tf_label} bars · "
+        f"({dates[0]} → {dates[-1]}) · showing {len(disp):,} {tf_label} bars "
+        f"· window: {chart_tf} · "
         f"updated {datetime.now(ET).strftime('%H:%M:%S')} ET")
 
 
