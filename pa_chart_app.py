@@ -6,6 +6,10 @@ book (@FORRNEERO), drawn on the chart for any US stock:
     flips to support and vice versa)
   * TRENDLINES from swing highs / lows — drawn only when tested >= 2 times;
     the upper line is the book's "selling area", the lower the buying area
+  * CHART PATTERN RECOGNITION — ranges/consolidations, triangles, wedges,
+    flags/pennants after a fierce pole, and staircase push-pause sequences;
+    each detected pattern is outlined and labeled FORMING, ACTIVE, or
+    BREAKOUT / BREAKDOWN CONFIRMED with its trigger and invalidation levels
   * CANDLESTICK FORMATIONS marked where they occur — highlighted ONLY when
     they form AT a level (the book's core rule: a candle mid-chart means
     nothing); mid-chart formations are drawn faint
@@ -297,6 +301,504 @@ def trendlines(df: pd.DataFrame) -> list[dict]:
     return out
 
 
+# ---------------------------------------------------------------- chart patterns
+def _make_chart_pattern(name: str, bias: str, status: str, start: int,
+                        end: int, segments: list[dict], label_x: int,
+                        label_y: float, trigger: float | None,
+                        invalidation: float | None, detail: str,
+                        score: float, family: str,
+                        box: dict | None = None) -> dict:
+    return {"name": name, "bias": bias, "status": status,
+            "start": int(start), "end": int(end), "segments": segments,
+            "label_x": int(label_x), "label_y": float(label_y),
+            "trigger": trigger, "invalidation": invalidation,
+            "detail": detail, "score": float(score), "family": family,
+            "box": box}
+
+
+def _fit_line(xs, ys) -> tuple[float, float] | None:
+    if len(xs) < 2 or len(set(xs)) < 2:
+        return None
+    slope, intercept = np.polyfit(np.asarray(xs, dtype=float),
+                                  np.asarray(ys, dtype=float), 1)
+    return float(slope), float(intercept)
+
+
+def _line_at(fit: tuple[float, float], x: int) -> float:
+    return fit[0] * x + fit[1]
+
+
+def _detect_range_pattern(df: pd.DataFrame) -> dict | None:
+    """A tradeable sideways range: repeated tests of two horizontal
+    boundaries, little net drift, plus a confirmed break when the close has
+    left the range within the last 15 bars."""
+    n = len(df)
+    if n < 18:
+        return None
+    H = df["High"].to_numpy()
+    L = df["Low"].to_numpy()
+    C = df["Close"].to_numpy()
+    all_highs, all_lows = swing_points(df, w=3)
+    best = None
+    for end in range(n - 1, max(11, n - 31), -1):
+        for start in range(max(0, end - 89), end - 11):
+            length = end - start + 1
+            hi = float(H[start:end + 1].max())
+            lo = float(L[start:end + 1].min())
+            mid = (hi + lo) / 2.0
+            if mid <= 0:
+                continue
+            width = (hi - lo) / mid * 100.0
+            if not 0.25 <= width <= 4.0:
+                continue
+            slope = np.polyfit(np.arange(length), C[start:end + 1], 1)[0]
+            drift = abs(float(slope) * (length - 1) / mid * 100.0)
+            if drift > max(0.45, width * 0.70):
+                continue
+            tol = max(mid * 0.0012, (hi - lo) * 0.18)
+            # Count swing tests, not ordinary bars: in a noisy range almost
+            # every candle can brush a boundary, which proves nothing.
+            upper_tests = sum(1 for i in all_highs
+                              if start <= i <= end and H[i] >= hi - tol)
+            lower_tests = sum(1 for i in all_lows
+                              if start <= i <= end and L[i] <= lo + tol)
+            if upper_tests < 2 or lower_tests < 2:
+                continue
+            status, bias = "FORMING", "neutral"
+            if end < n - 1:
+                tail = C[end + 1:]
+                above = np.where(tail > hi * 1.0003)[0]
+                below = np.where(tail < lo * 0.9997)[0]
+                first_above = int(above[0]) if len(above) else 999
+                first_below = int(below[0]) if len(below) else 999
+                if first_above < first_below:
+                    event_i = end + 1 + first_above
+                    if first_above > 5 or n - 1 - event_i > 8:
+                        continue
+                    if C[-1] < lo:
+                        continue
+                    status = ("BREAKOUT CONFIRMED" if C[-1] >= hi
+                              else "BREAKOUT / BACK IN RANGE")
+                    bias = "bull"
+                elif first_below < first_above:
+                    event_i = end + 1 + first_below
+                    if first_below > 5 or n - 1 - event_i > 8:
+                        continue
+                    if C[-1] > hi:
+                        continue
+                    status = ("BREAKDOWN CONFIRMED" if C[-1] <= lo
+                              else "BREAKDOWN / BACK IN RANGE")
+                    bias = "bear"
+                elif end < n - 4:
+                    continue
+            trigger = hi if bias != "bear" else lo
+            invalidation = lo if bias != "bear" else hi
+            score = (upper_tests + lower_tests) * 10 + min(length, 60) \
+                + (30 if status != "FORMING" else 12) - width * 3 \
+                - abs(n - 1 - end)
+            cand = _make_chart_pattern(
+                "Range / Consolidation", bias, status, start, n - 1,
+                [{"x0": start, "y0": hi, "x1": n - 1, "y1": hi},
+                 {"x0": start, "y0": lo, "x1": n - 1, "y1": lo}],
+                start, hi, trigger, invalidation,
+                f"{length} bars · {upper_tests} upper tests / "
+                f"{lower_tests} lower tests · width {width:.2f}%",
+                score, "consolidation",
+                box={"x0": start, "x1": n - 1, "y0": lo, "y1": hi})
+            if best is None or cand["score"] > best["score"]:
+                best = cand
+    return best
+
+
+def _detect_triangle_pattern(df: pd.DataFrame) -> dict | None:
+    """Triangles and wedges from fitted swing-high / swing-low boundary
+    lines. A pattern qualifies only when the two lines converge and price
+    is mostly contained between them."""
+    n = len(df)
+    if n < 24:
+        return None
+    H = df["High"].to_numpy()
+    L = df["Low"].to_numpy()
+    C = df["Close"].to_numpy()
+    all_highs, all_lows = swing_points(df, w=3)
+    best = None
+    for end in range(n - 1, max(14, n - 31), -1):
+        for start in range(max(0, end - 89), end - 14):
+            highs = [i for i in all_highs if start <= i <= end]
+            lows = [i for i in all_lows if start <= i <= end]
+            if len(highs) < 2 or len(lows) < 2 \
+                    or len(highs) + len(lows) < 5:
+                continue
+            first = min(highs[0], lows[0])
+            last_swing = max(highs[-1], lows[-1])
+            if last_swing - first < 12:
+                continue
+            if last_swing < end - 15 or highs[-1] < end - 25 \
+                    or lows[-1] < end - 25:
+                continue
+            upper = _fit_line(highs, [H[i] for i in highs])
+            lower = _fit_line(lows, [L[i] for i in lows])
+            if upper is None or lower is None:
+                continue
+            u0, u1 = _line_at(upper, first), _line_at(upper, end)
+            l0, l1 = _line_at(lower, first), _line_at(lower, end)
+            start_width, end_width = u0 - l0, u1 - l1
+            mid = (u0 + l0) / 2.0
+            if mid <= 0 or start_width <= 0 or end_width <= 0:
+                continue
+            start_width_pct = start_width / mid * 100.0
+            if not 0.35 <= start_width_pct <= 6.0:
+                continue
+            compression = end_width / start_width
+            if not 0.22 <= compression <= 0.82:
+                continue
+            upper_resid = np.mean([abs(H[i] - _line_at(upper, i))
+                                   for i in highs]) / start_width
+            lower_resid = np.mean([abs(L[i] - _line_at(lower, i))
+                                   for i in lows]) / start_width
+            if upper_resid > 0.22 or lower_resid > 0.22:
+                continue
+            upper_change = (u1 - u0) / mid * 100.0
+            lower_change = (l1 - l0) / mid * 100.0
+            flat = max(0.18, start_width_pct * 0.18)
+            if upper_change <= -0.25 and lower_change >= 0.25:
+                name = "Symmetrical Triangle"
+            elif abs(upper_change) <= flat and lower_change >= 0.30:
+                name = "Ascending Triangle"
+            elif abs(lower_change) <= flat and upper_change <= -0.30:
+                name = "Descending Triangle"
+            elif upper_change > 0.20 and lower_change > upper_change + 0.20:
+                name = "Rising Wedge"
+            elif upper_change < -0.20 and upper_change < lower_change - 0.20:
+                name = "Falling Wedge"
+            else:
+                continue
+            xs = np.arange(first, end + 1)
+            tol = max(mid * 0.0015, start_width * 0.12)
+            inside = ((C[first:end + 1] <= _line_at(upper, xs) + tol)
+                      & (C[first:end + 1] >= _line_at(lower, xs) - tol))
+            containment = float(inside.mean())
+            if containment < 0.90:
+                continue
+            u_last = _line_at(upper, n - 1)
+            l_last = _line_at(lower, n - 1)
+            buffer = max(mid * 0.0003, max(end_width, 0.0) * 0.03)
+
+            def side_at(j: int) -> int:
+                if C[j] > _line_at(upper, j) + buffer:
+                    return 1
+                if C[j] < _line_at(lower, j) - buffer:
+                    return -1
+                return 0
+
+            last_side = side_at(n - 1)
+            if last_side:
+                # "Confirmed" means the crossing itself is fresh. A pattern
+                # whose boundary was crossed long ago is history, not a
+                # current recognition result.
+                cross_i = None
+                for j in range(max(first + 1, n - 7), n):
+                    if side_at(j) == last_side and side_at(j - 1) != last_side:
+                        cross_i = j
+                        break
+                if cross_i is None:
+                    continue
+                if last_side == 1:
+                    status, bias = "BREAKOUT CONFIRMED", "bull"
+                    trigger, invalidation = u_last, l_last
+                else:
+                    status, bias = "BREAKDOWN CONFIRMED", "bear"
+                    trigger, invalidation = l_last, u_last
+            else:
+                if end < n - 4:
+                    continue
+                status, bias = "FORMING", "neutral"
+                if name == "Ascending Triangle":
+                    bias = "bull"
+                elif name == "Descending Triangle":
+                    bias = "bear"
+                trigger, invalidation = u_last, l_last
+            score = len(highs) + len(lows) + containment * 20 \
+                + (1.0 - compression) * 25 + min(end - first, 60) * 0.25 \
+                + (25 if status != "FORMING" else 8)
+            cand = _make_chart_pattern(
+                name, bias, status, first, n - 1,
+                [{"x0": first, "y0": u0, "x1": n - 1, "y1": u_last},
+                 {"x0": first, "y0": l0, "x1": n - 1, "y1": l_last}],
+                max(first, n - 12), (u_last + l_last) / 2.0,
+                trigger, invalidation,
+                f"{len(highs)} swing highs / {len(lows)} swing lows · "
+                f"range compressed to {compression:.0%} · "
+                f"{containment:.0%} contained",
+                score, "consolidation")
+            if best is None or cand["score"] > best["score"]:
+                best = cand
+    return best
+
+
+def _detect_flag_pattern(df: pd.DataFrame) -> dict | None:
+    """Flags and pennants, using the book's sequence: a fierce pole on
+    strong movement, then a small contained pause. Parallel counter-trend
+    boundaries = flag; converging boundaries = pennant."""
+    n = len(df)
+    if n < 22:
+        return None
+    H = df["High"].to_numpy()
+    L = df["Low"].to_numpy()
+    C = df["Close"].to_numpy()
+    V = df["Volume"].to_numpy()
+    best = None
+    for direction in (1, -1):
+        for pole_end in range(max(10, n - 90), n - 5):
+            for pole_len in range(4, 21):
+                pole_start = pole_end - pole_len
+                if pole_start < 0:
+                    continue
+                if direction == 1:
+                    base = float(L[pole_start])
+                    extreme = float(H[pole_end])
+                else:
+                    base = float(H[pole_start])
+                    extreme = float(L[pole_end])
+                move = direction * (extreme / base - 1.0) * 100.0
+                if not 0.75 <= move <= 8.0:
+                    continue
+                pole_slope = np.polyfit(
+                    np.arange(pole_len + 1),
+                    C[pole_start:pole_end + 1], 1)[0]
+                if direction * pole_slope <= 0:
+                    continue
+                pole_vol = float(V[pole_start:pole_end + 1].mean())
+                prior_vol = float(V[max(0, pole_start - 20):pole_start].mean()) \
+                    if pole_start >= 5 else 0.0
+                vol_ratio = pole_vol / prior_vol if prior_vol > 0 else 1.0
+                # The book requires the pole to be a fierce move on heavy
+                # volume. Without that evidence, an ordinary oscillation can
+                # masquerade as a flagpole.
+                if prior_vol <= 0 or vol_ratio < 1.30:
+                    continue
+                move_abs = abs(extreme - base)
+                for cons_len in range(6, 36):
+                    end = pole_end + cons_len
+                    if end >= n:
+                        break
+                    seg = slice(pole_end, end + 1)
+                    xs = np.arange(pole_end, end + 1)
+                    upper = _fit_line(xs, H[seg])
+                    lower = _fit_line(xs, L[seg])
+                    if upper is None or lower is None:
+                        continue
+                    width_abs = float(H[seg].max() - L[seg].min())
+                    if width_abs > move_abs * 0.75:
+                        continue
+                    if direction == 1:
+                        if H[seg].max() > extreme * 1.0015:
+                            continue
+                        if L[seg].min() < extreme - move_abs * 0.58:
+                            continue
+                    else:
+                        if L[seg].min() < extreme * 0.9985:
+                            continue
+                        if H[seg].max() > extreme + move_abs * 0.58:
+                            continue
+                    u_change = (_line_at(upper, end)
+                                - _line_at(upper, pole_end)) / extreme * 100
+                    l_change = (_line_at(lower, end)
+                                - _line_at(lower, pole_end)) / extreme * 100
+                    pennant = (direction == 1 and u_change < -0.08
+                               and l_change > 0.08) or \
+                        (direction == -1 and u_change < -0.08
+                         and l_change > 0.08)
+                    flag = False
+                    if direction == 1:
+                        flag = u_change < 0.08 and l_change < 0.08 \
+                            and u_change > -1.0 and l_change > -1.0 \
+                            and abs(u_change - l_change) < 0.45
+                    else:
+                        flag = u_change > -0.08 and l_change > -0.08 \
+                            and u_change < 1.0 and l_change < 1.0 \
+                            and abs(u_change - l_change) < 0.45
+                    if not pennant and not flag:
+                        continue
+                    tol = max(extreme * 0.0015, width_abs * 0.12)
+                    inside = ((C[seg] <= _line_at(upper, xs) + tol)
+                              & (C[seg] >= _line_at(lower, xs) - tol))
+                    if float(inside.mean()) < 0.82:
+                        continue
+                    u_last = _line_at(upper, n - 1)
+                    l_last = _line_at(lower, n - 1)
+                    if direction == 1:
+                        if C[-1] > u_last:
+                            status, bias = "BREAKOUT CONFIRMED", "bull"
+                            trigger, invalidation = u_last, l_last
+                        elif C[-1] < l_last:
+                            continue
+                        else:
+                            if end < n - 4:
+                                continue
+                            status, bias = "FORMING", "bull"
+                            trigger, invalidation = u_last, l_last
+                    else:
+                        if C[-1] < l_last:
+                            status, bias = "BREAKDOWN CONFIRMED", "bear"
+                            trigger, invalidation = l_last, u_last
+                        elif C[-1] > u_last:
+                            continue
+                        else:
+                            if end < n - 4:
+                                continue
+                            status, bias = "FORMING", "bear"
+                            trigger, invalidation = l_last, u_last
+                    kind = "Pennant" if pennant else "Flag"
+                    name = ("Bull " if direction == 1 else "Bear ") + kind
+                    pole_y0 = base
+                    pole_y1 = extreme
+                    score = move * 8 + min(vol_ratio, 2.0) * 8 \
+                        + float(inside.mean()) * 15 + min(cons_len, 30) \
+                        + (25 if status != "FORMING" else 8)
+                    cand = _make_chart_pattern(
+                        name, bias, status, pole_start, n - 1,
+                        [{"x0": pole_start, "y0": pole_y0,
+                          "x1": pole_end, "y1": pole_y1},
+                         {"x0": pole_end, "y0": _line_at(upper, pole_end),
+                          "x1": n - 1, "y1": u_last},
+                         {"x0": pole_end, "y0": _line_at(lower, pole_end),
+                          "x1": n - 1, "y1": l_last}],
+                        max(pole_end, n - 12),
+                        u_last if direction == 1 else l_last,
+                        trigger, invalidation,
+                        f"pole {move:.2f}% in {pole_len + 1} bars · "
+                        f"pole volume {vol_ratio:.2f}x prior · "
+                        f"pause {cons_len + 1} bars",
+                        score, "consolidation")
+                    if best is None or cand["score"] > best["score"]:
+                        best = cand
+    return best
+
+
+def _detect_staircase_pattern(df: pd.DataFrame) -> dict | None:
+    """A staircase is a sequence of pushes separated by pauses: successive
+    swing highs and swing lows both step in the trend direction."""
+    n = len(df)
+    if n < 35:
+        return None
+    H = df["High"].to_numpy()
+    L = df["Low"].to_numpy()
+    C = df["Close"].to_numpy()
+    highs, lows = swing_points(df, w=3)
+    raw = [(i, "H", float(H[i])) for i in highs]
+    raw += [(i, "L", float(L[i])) for i in lows]
+    raw.sort()
+    points: list[tuple[int, str, float]] = []
+    for point in raw:
+        if points and points[-1][1] == point[1]:
+            prev = points[-1]
+            if (point[1] == "H" and point[2] > prev[2]) or \
+                    (point[1] == "L" and point[2] < prev[2]):
+                points[-1] = point
+        else:
+            points.append(point)
+    if len(points) < 5:
+        return None
+    best = None
+    for end_i in range(len(points) - 1, 3, -1):
+        if n - 1 - points[end_i][0] > 30:
+            continue
+        for start_i in range(max(0, end_i - 8), end_i - 3):
+            seq = points[start_i:end_i + 1]
+            if len(seq) < 5:
+                continue
+            hs = [p for p in seq if p[1] == "H"]
+            ls = [p for p in seq if p[1] == "L"]
+            if len(hs) < 3 or len(ls) < 3:
+                continue
+            bull_steps = all(hs[j][2] > hs[j - 1][2] * 1.0012
+                             for j in range(1, len(hs))) and \
+                all(ls[j][2] > ls[j - 1][2] * 1.0012
+                    for j in range(1, len(ls)))
+            bear_steps = all(hs[j][2] < hs[j - 1][2] * 0.9988
+                             for j in range(1, len(hs))) and \
+                all(ls[j][2] < ls[j - 1][2] * 0.9988
+                    for j in range(1, len(ls)))
+            if not bull_steps and not bear_steps:
+                continue
+            direction = 1 if bull_steps else -1
+            last_h, last_l = hs[-1], ls[-1]
+            if direction == 1:
+                if C[-1] < last_l[2]:
+                    continue
+                trigger, invalidation = last_h[2], last_l[2]
+                bias, name = "bull", "Bullish Staircase"
+            else:
+                if C[-1] > last_h[2]:
+                    continue
+                trigger, invalidation = last_l[2], last_h[2]
+                bias, name = "bear", "Bearish Staircase"
+            segments = [{"x0": seq[j][0], "y0": seq[j][2],
+                         "x1": seq[j + 1][0], "y1": seq[j + 1][2]}
+                        for j in range(len(seq) - 1)]
+            segments.append({"x0": seq[-1][0], "y0": trigger,
+                             "x1": n - 1, "y1": trigger})
+            score = len(seq) * 8 + (len(hs) + len(ls)) * 2 \
+                - (n - 1 - seq[-1][0]) * 0.25
+            cand = _make_chart_pattern(
+                name, bias, "ACTIVE", seq[0][0], n - 1, segments,
+                seq[-1][0], trigger, trigger, invalidation,
+                f"{len(hs)} stepping highs / {len(ls)} stepping lows · "
+                "push-pause sequence still intact",
+                score, "staircase")
+            if best is None or cand["score"] > best["score"]:
+                best = cand
+    return best
+
+
+def detect_chart_patterns(df: pd.DataFrame) -> list[dict]:
+    """Current chart-pattern recognition for the displayed session. Returns
+    at most three non-duplicative patterns, confirmed breaks first."""
+    found = []
+    for detector in (_detect_range_pattern, _detect_triangle_pattern,
+                     _detect_flag_pattern, _detect_staircase_pattern):
+        try:
+            pattern = detector(df)
+        except Exception:
+            pattern = None
+        if pattern is not None:
+            found.append(pattern)
+    if not found:
+        return []
+
+    def overlap(a: dict, b: dict) -> float:
+        lo = max(a["start"], b["start"])
+        hi = min(a["end"], b["end"])
+        span = max(a["end"] - a["start"], b["end"] - b["start"], 1)
+        return max(0, hi - lo) / span
+
+    def specificity(pattern: dict) -> int:
+        # When geometries overlap, a converging or pole-based pattern is a
+        # more specific description than the generic range that contains it.
+        if pattern["name"].startswith("Range"):
+            return 1
+        if "Staircase" in pattern["name"]:
+            return 2
+        return 3
+
+    found.sort(key=lambda p: (p["status"] != "FORMING"
+                              and p["status"] != "ACTIVE",
+                              specificity(p), p["score"]), reverse=True)
+    kept: list[dict] = []
+    for pattern in found:
+        duplicate = False
+        for other in kept:
+            if pattern["family"] == other["family"] == "consolidation" \
+                    and overlap(pattern, other) >= 0.60:
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append(pattern)
+        if len(kept) >= 3:
+            break
+    return kept
+
 # ---------------------------------------------------------------- candle formations
 def candle_patterns(df: pd.DataFrame) -> dict[int, tuple[str, str]]:
     """Positional index -> (pattern name, bias 'bull' | 'bear' | 'neutral').
@@ -567,7 +1069,8 @@ PHASES = [(570, 630, "Opening drive", "rgba(37, 99, 235, 0.05)"),
 def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
                 lines: list[dict], pats: dict[int, tuple[str, str]],
                 levels: list[float], pa: dict | None, orng: dict | None,
-                show: dict, window_start=None) -> go.Figure:
+                show: dict, window_start=None,
+                chart_patterns: list[dict] | None = None) -> go.Figure:
     """3 panels: price (candles, EMA 9/21, VWAP, zones, trendlines, PDH/PDC/
     PDL, opening range, pattern markers, time-cycle phases), volume,
     stochastic."""
@@ -668,6 +1171,43 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
                 mode="lines", line=dict(width=1.6, color=col, dash="dot")),
                 row=1, col=1)
 
+    # Chart-pattern recognition: ranges, triangles/wedges, flags/pennants
+    # and staircases. Boundary lines are drawn in a heavier style than the
+    # ordinary trendlines, with the pattern name and status on the chart.
+    if show.get("chart_patterns") and chart_patterns:
+        pattern_colors = {"bull": "#16a34a", "bear": "#dc2626",
+                          "neutral": "#7c3aed"}
+        for pat in chart_patterns:
+            color = pattern_colors.get(pat["bias"], "#7c3aed")
+            if pat.get("box"):
+                box = pat["box"]
+                fig.add_shape(
+                    type="rect", xref="x", yref="y",
+                    x0=x[box["x0"]], x1=x[box["x1"]],
+                    y0=box["y0"], y1=box["y1"],
+                    fillcolor="rgba(124, 58, 237, 0.055)",
+                    line=dict(color="rgba(124, 58, 237, 0.25)", width=1),
+                    row=1, col=1)
+            for j, seg in enumerate(pat["segments"]):
+                fig.add_trace(go.Scatter(
+                    x=[x[seg["x0"]], x[seg["x1"]]],
+                    y=[seg["y0"], seg["y1"]],
+                    mode="lines", name=pat["name"] if j == 0 else pat["name"],
+                    legendgroup=pat["name"], showlegend=(j == 0),
+                    line=dict(width=2.4, color=color,
+                              dash="solid" if pat["family"] != "staircase"
+                              else "dashdot")),
+                    row=1, col=1)
+            label = f"{pat['name']}<br>{pat['status']}"
+            fig.add_trace(go.Scatter(
+                x=[x[pat["label_x"]]], y=[pat["label_y"]],
+                mode="markers+text", text=[label],
+                textposition="top center",
+                textfont=dict(size=10, color=color),
+                marker=dict(size=8, color=color, symbol="diamond"),
+                name=f"{pat['name']} label", showlegend=False),
+                row=1, col=1)
+
     # Candlestick formations: highlighted at a level, faint elsewhere
     if show.get("patterns"):
         strong = [(i, p) for i, p in pats.items()
@@ -764,8 +1304,9 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
 st.set_page_config(page_title="Price-Action Charting", layout="wide")
 st.title("📐 Price-Action Charting")
 st.caption("The charting techniques from the *Price Action Trading* book — "
-           "zones, trendlines, formations at levels, EMA 9/21, stochastic — "
-           "drawn on any US stock. Display only: no verdicts, no signals.")
+           "zones, trendlines, chart-pattern recognition, formations at "
+           "levels, EMA 9/21, stochastic — drawn on any US stock. "
+           "Display only: no verdicts, no signals.")
 
 _key, _secret, _feed = _secrets()
 if not _key or not _secret:
@@ -803,6 +1344,9 @@ with st.sidebar:
     show = {
         "zones": st.checkbox("Support / resistance zones", value=True),
         "lines": st.checkbox("Trendlines", value=True),
+        "chart_patterns": st.checkbox(
+            "Pattern recognition (ranges, triangles, wedges, flags, "
+            "pennants, staircases)", value=True),
         "patterns": st.checkbox("Candlestick formations", value=True),
         "phases": st.checkbox("Time-cycle phases", value=True),
     }
@@ -842,6 +1386,7 @@ def render():
     orng = opening_range(today_df)
     zones = sr_zones(disp)
     lines = trendlines(disp)
+    chart_pats = detect_chart_patterns(disp)
     pats = candle_patterns(disp)
     level_vals = ([pa["PDH"], pa["PDC"], pa["PDL"]] if pa else []) \
         + [z["center"] for z in zones] \
@@ -867,9 +1412,35 @@ def render():
     window_start = (disp.index[-1] - pd.Timedelta(minutes=trailing)
                     if trailing is not None else None)
     st.plotly_chart(build_chart(disp, symbol, zones, lines, pats, level_vals,
-                                pa, orng, show, window_start=window_start),
+                                pa, orng, show, window_start=window_start,
+                                chart_patterns=chart_pats),
                     use_container_width=True,
                     key=f"pa_{symbol}_{tf_label}_{chart_tf.replace(' ', '_')}")
+
+    if show.get("chart_patterns"):
+        st.markdown("**Pattern recognition** (the book's chart patterns — "
+                    "ranges, triangles, wedges, flags/pennants and "
+                    "staircases):")
+        if chart_pats:
+            icons = {"bull": "🟢", "bear": "🔴", "neutral": "🟣"}
+            rows = []
+            for pat in chart_pats:
+                trigger = (f"trigger ${pat['trigger']:,.2f}"
+                           if pat["trigger"] is not None else "trigger —")
+                invalid = (f"invalidation ${pat['invalidation']:,.2f}"
+                           if pat["invalidation"] is not None
+                           else "invalidation —")
+                rows.append(
+                    f"- {icons.get(pat['bias'], '🟣')} **{pat['name']} — "
+                    f"{pat['status']}** · {trigger} · {invalid} · "
+                    f"{pat['detail']}")
+            st.markdown("\n".join(rows))
+        else:
+            st.caption("No qualifying chart pattern in the current session "
+                       "yet. The detector requires a repeated range, "
+                       "converging boundaries, a fierce pole followed by a "
+                       "contained pause, or a clean stepping sequence — it "
+                       "does not force a pattern onto ordinary noise.")
 
     # Put/Call Ratio strip (user's bands) — slow bucket: PCR does not need
     # the fast refresh cycle, and the chain pull takes a few seconds.
@@ -931,6 +1502,13 @@ with st.expander("How to read this chart"):
         "- **Dotted trendlines** — through the two most recent swing "
         "highs/lows, kept only when tested at least twice. Price hitting the "
         "upper line is the book's selling area; the lower line, buying area.\n"
+        "- **Pattern recognition panel + heavy outlines** — the detector "
+        "names the current range, triangle, wedge, flag/pennant or staircase "
+        "and states whether it is forming/active or has confirmed a break. "
+        "The listed trigger is the boundary that confirms the move; the "
+        "invalidation is the opposite boundary. A flag/pennant is only "
+        "recognized after a fierce pole followed by a small contained "
+        "pause, as the book defines it.\n"
         "- **Triangles / diamonds on the candles** — candlestick formations. "
         "Labeled ones formed **at a level** (that's when the book says they "
         "count); faint unlabeled ones formed mid-chart and are shown for "
