@@ -96,7 +96,8 @@ def fetch_bars_1m(symbol: str, days: int = LOAD_DAYS) -> pd.DataFrame:
     df = pd.DataFrame(rows).rename(columns={
         "t": "ts", "o": "Open", "h": "High", "l": "Low", "c": "Close",
         "v": "Volume"})
-    df.index = pd.to_datetime(df["ts"], utc=True).tz_convert(ET)
+    df.index = pd.DatetimeIndex(
+        pd.to_datetime(df["ts"], utc=True)).tz_convert(ET)
     df = df[["Open", "High", "Low", "Close", "Volume"]].astype(float)
     df = df.sort_index()
     mins = df.index.hour * 60 + df.index.minute
