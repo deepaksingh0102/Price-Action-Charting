@@ -470,12 +470,15 @@ def fetch_pcr_alpaca(symbol: str, bucket: int = 0) -> dict | None:
             pcr_vol = pv / cv if cv > 0 else None
             pcr_oi = poi / coi if coi > 0 else None
             src = f"Alpaca ({feed})"
+            asof = datetime.now(ET).strftime("%H:%M")
             if pcr_vol is not None:
                 return {"pcr": pcr_vol, "kind": "volume",
-                        "pcr_vol": pcr_vol, "pcr_oi": pcr_oi, "source": src}
+                        "pcr_vol": pcr_vol, "pcr_oi": pcr_oi, "source": src,
+                        "asof": asof, "pv": pv, "cv": cv}
             if pcr_oi is not None:
                 return {"pcr": pcr_oi, "kind": "open interest",
-                        "pcr_vol": None, "pcr_oi": pcr_oi, "source": src}
+                        "pcr_vol": None, "pcr_oi": pcr_oi, "source": src,
+                        "asof": asof, "pv": pv, "cv": cv}
         except Exception:
             continue
     return None
@@ -501,21 +504,32 @@ def fetch_pcr_yahoo(symbol: str, bucket: int = 0) -> dict | None:
             coi += float(ch.calls["openInterest"].fillna(0).sum())
         pcr_vol = pv / cv if cv > 0 else None
         pcr_oi = poi / coi if coi > 0 else None
+        asof = datetime.now(ET).strftime("%H:%M")
         if pcr_vol is not None:
             return {"pcr": pcr_vol, "kind": "volume",
-                    "pcr_vol": pcr_vol, "pcr_oi": pcr_oi, "source": "Yahoo"}
+                    "pcr_vol": pcr_vol, "pcr_oi": pcr_oi, "source": "Yahoo",
+                    "asof": asof, "pv": pv, "cv": cv}
         if pcr_oi is not None:
             return {"pcr": pcr_oi, "kind": "open interest",
-                    "pcr_vol": None, "pcr_oi": pcr_oi, "source": "Yahoo"}
+                    "pcr_vol": None, "pcr_oi": pcr_oi, "source": "Yahoo",
+                    "asof": asof, "pv": pv, "cv": cv}
         return None
     except Exception:
         return None
 
 
 def fetch_pcr(symbol: str, bucket: int = 0) -> dict | None:
-    """PCR with source preference: Alpaca first (the app's own data plane),
-    Yahoo as the fallback."""
-    return fetch_pcr_alpaca(symbol, bucket) or fetch_pcr_yahoo(symbol, bucket)
+    """PCR source preference: a VOLUME-based PCR always wins — it's the one
+    that moves intraday. Alpaca first; if Alpaca serves only open interest
+    (its volume fields come back empty on some feeds), Yahoo's volume PCR
+    takes over; open interest is the last resort."""
+    a = fetch_pcr_alpaca(symbol, bucket)
+    if a is not None and a["kind"] == "volume":
+        return a
+    y = fetch_pcr_yahoo(symbol, bucket)
+    if y is not None and y["kind"] == "volume":
+        return y
+    return a or y
 
 
 def build_pcr_gauge(pcr: float) -> go.Figure:
@@ -868,8 +882,9 @@ def render():
             st.markdown(f"**{zlabel}**")
             oi_txt = (f" · PCR by open interest {p['pcr_oi']:.2f}"
                       if p["pcr_oi"] is not None else "")
-            st.caption(f"Options chain via {p['source']} · nearest "
-                       f"expiries{oi_txt}")
+            st.caption(f"Options chain via {p['source']} · updated "
+                       f"{p['asof']} ET · puts {p['pv']:,.0f} / calls "
+                       f"{p['cv']:,.0f} traded today{oi_txt}")
         with pc2:
             st.plotly_chart(build_pcr_gauge(p["pcr"]),
                             use_container_width=True, key=f"pcr_{symbol}")
