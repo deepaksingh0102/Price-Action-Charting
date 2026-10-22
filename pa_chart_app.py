@@ -566,7 +566,8 @@ def render():
         keep = dates[-3:]
     else:
         keep = dates
-    df = df1[df1.index.date.isin(keep)]
+    df = df1[df1.index.normalize().isin(
+        [pd.Timestamp(d, tz=ET) for d in keep])]
     minutes = {"1 min": 1, "5 min": 5, "15 min": 15}[tf_label]
     disp = add_indicators(resample(df, minutes))
     if len(disp) < 30:
