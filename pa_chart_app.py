@@ -579,8 +579,9 @@ def render():
     df = df1[df1.index.normalize() == pd.Timestamp(dates[-1], tz=ET)]
     minutes = {"1 min": 1, "5 min": 5, "15 min": 15}[tf_label]
     disp = add_indicators(resample(df, minutes))
-    if len(disp) < 30:
-        st.info("Not enough bars in this view yet — try a smaller bar size.")
+    if len(disp) < 10:
+        st.info("Only the first few bars of the session so far — the chart "
+                "builds as bars arrive.")
         return
 
     pa = prior_day_levels(df1)
@@ -606,7 +607,8 @@ def render():
               if pd.notna(last["StochK"]) else "—")
     checks = confluence(disp, zones, level_vals)
     score = sum(1 for _, ok in checks if ok)
-    c4.metric("Confluence (book stack)", f"{score} / {len(checks)}")
+    c4.metric("Confluence (book stack)",
+              f"{score} / {len(checks)}" if checks else "—")
 
     trailing = CHART_TF_TRAILING[chart_tf]
     window_start = (disp.index[-1] - pd.Timedelta(minutes=trailing)
