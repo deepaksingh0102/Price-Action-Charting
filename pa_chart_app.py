@@ -81,8 +81,22 @@ def alpaca_get(path: str, params: dict, tries: int = 4) -> dict:
     return {}
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_bars_1m(symbol: str, days: int = LOAD_DAYS) -> pd.DataFrame:
+def _bucket(live: bool, refresh_secs: int) -> int:
+    """Time bucket (live tracking) + manual-refresh nonce — same scheme as
+    the stock-analyzer's. The bucket is part of the fetch's cache key, so a
+    new bucket (interval elapsed, or 🔄 Refresh now bumped the nonce) forces
+    a fresh Alpaca fetch; within a bucket the cached bars are reused."""
+    base = int(time.time() // refresh_secs) if live else 0
+    try:
+        nonce = st.session_state.get("refresh_nonce", 0)
+    except Exception:
+        nonce = 0
+    return base + nonce
+
+
+@st.cache_data(show_spinner=False)
+def fetch_bars_1m(symbol: str, bucket: int = 0,
+                  days: int = LOAD_DAYS) -> pd.DataFrame:
     """Last `days` calendar days of 1-minute bars, regular hours only
     (09:30-16:00 ET), paginated (Alpaca's limit is per page)."""
     _, _, feed = _secrets()
@@ -546,6 +560,19 @@ with st.sidebar:
         help="How much recent history the chart shows — same control as the "
              "stock-analyzer's. Zones, trendlines and formations are "
              "computed on the full session and stay drawn across the window.")
+    live = st.toggle("Live tracking (auto-refresh)", value=True,
+                     help="When on, the chart re-runs automatically at the "
+                          "interval below.")
+    refresh_secs = st.number_input(
+        "Refresh every (seconds)", min_value=30, max_value=3600, value=30,
+        step=5,
+        help="How often live tracking re-runs the chart. Below 30s the "
+             "server runs out of threads/memory.")
+    if st.button("🔄 Refresh now"):
+        # The click itself reruns the app; bumping the nonce changes the
+        # fetch bucket, so the loaders pull fresh bars.
+        st.session_state["refresh_nonce"] = \
+            st.session_state.get("refresh_nonce", 0) + 1
     st.header("Show")
     show = {
         "zones": st.checkbox("Support / resistance zones", value=True),
@@ -568,7 +595,7 @@ def in_market_hours(now: datetime | None = None) -> bool:
 
 def render():
     try:
-        df1 = fetch_bars_1m(symbol)
+        df1 = fetch_bars_1m(symbol, _bucket(live, int(refresh_secs)))
     except Exception as e:
         st.error(f"Could not load bars for {symbol}: {e}")
         return
@@ -629,12 +656,17 @@ def render():
         f"updated {datetime.now(ET).strftime('%H:%M:%S')} ET")
 
 
-if in_market_hours():
-    st.fragment(run_every=30)(render)()
+if live and in_market_hours():
+    st.fragment(run_every=int(refresh_secs))(render)()
+elif live:
+    render()
+    st.caption("Live tracking is on, but the market is closed — showing the "
+               "last session without auto-refresh.")
 else:
     render()
-    st.caption("Market is closed — showing the last loaded session without "
-               "auto-refresh.")
+    st.caption("Live tracking is off — this is a one-time snapshot. "
+               "Turn on **Live tracking** in the sidebar for auto-refresh, "
+               "or use 🔄 Refresh now.")
 
 with st.expander("How to read this chart"):
     st.markdown(
