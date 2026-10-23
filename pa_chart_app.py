@@ -20,9 +20,13 @@ book (@FORRNEERO), drawn on the chart for any US stock:
   * TIME CYCLES — the book names the technique but gives no method; this app
     draws the intraday session phases (opening drive / first hour, midday,
     final hour) as the cycle guide
-  * A confluence checklist — the book's "Premium" stack counted at the last
-    bar (fresh 9/21 cross, price at a level, pattern at the level, stochastic
-    confirmation, volume confirmation). Display only — no verdict, no gates.
+  * A WEIGHTED confluence score — the indicator hierarchy scored at the
+    last bar: location & structure 30, intraday trend 25, volume 15,
+    pattern & candle at a level 10, stochastic trigger 10, session
+    context (PCR zone + fresh EMA cross) 10. Bullish and bearish
+    evidence are scored separately; the larger total is the lean, and a
+    Tier-1-vs-Tier-2 conflict is flagged rather than averaged away.
+    Display only — no verdict, no gates.
 
 Data: Alpaca REST (same Secrets as the other apps). Self-contained file.
 """
@@ -51,7 +55,7 @@ ALPACA_BASE = "https://data.alpaca.markets/v2"
 # Version stamp: the footer shows this tag plus a hash computed live from
 # the deployed file itself, so the page proves which build is running —
 # compare it with the hash named when the file was delivered.
-BUILD_TAG = "2026-10-22"
+BUILD_TAG = "2026-10-23"
 
 
 def _build_hash() -> str:
@@ -864,52 +868,239 @@ def at_level(lo: float, hi: float, levels: list[float],
 
 
 # ---------------------------------------------------------------- confluence
-def confluence(df: pd.DataFrame, zones: list[dict],
-               levels: list[float]) -> list[tuple[str, bool]]:
-    """The book's Premium stack, evaluated at the last bar. Display only."""
-    checks: list[tuple[str, bool]] = []
+# The indicator hierarchy, weighted. Bullish and bearish evidence are
+# scored tier by tier and the larger total is the lean — a flat count of
+# checks let a stochastic cross outvote price structure, which is
+# backwards: everything below Tier 1 is derived from price. Weights:
+# location & structure 30, intraday trend 25, volume 15, pattern &
+# candle at a level 10, stochastic trigger 10, session context 10.
+TIER_WEIGHTS = [("Location & structure", 30), ("Intraday trend", 25),
+                ("Volume", 15), ("Pattern & candle at a level", 10),
+                ("Stochastic trigger", 10), ("Session context", 10)]
+
+
+def weighted_confluence(df: pd.DataFrame, zones: list[dict],
+                        levels: list[float], pa: dict | None,
+                        orng: dict | None, chart_pats: list[dict],
+                        pcr_label: str | None) -> dict | None:
+    """Weighted confluence at the last bar. Display only — no verdict.
+
+    Returns None until there are enough bars, else a dict with the lean
+    direction, its 0-100 score, both raw totals, the Tier-1-vs-Tier-2
+    conflict flag, one display row per tier and any filter notes."""
     if len(df) < 25:
-        return checks
-    e9, e21 = df["EMA9"], df["EMA21"]
-    cross_up = cross_dn = False
-    for i in range(len(df) - 10, len(df)):
-        if e9.iloc[i - 1] <= e21.iloc[i - 1] and e9.iloc[i] > e21.iloc[i]:
-            cross_up, cross_dn = True, False
-        if e9.iloc[i - 1] >= e21.iloc[i - 1] and e9.iloc[i] < e21.iloc[i]:
-            cross_dn, cross_up = True, False
-    checks.append(("Fresh 9/21 EMA cross in the last 10 bars "
-                   f"({'up' if cross_up else 'down' if cross_dn else 'none'})",
-                   cross_up or cross_dn))
+        return None
     last = df.iloc[-1]
     price = float(last["Close"])
-    all_levels = levels + [z["center"] for z in zones]
-    checks.append(("Price at a key level (zone / PDH / PDC / PDL / OR edge)",
-                   at_level(float(last["Low"]), float(last["High"]),
-                            all_levels)))
-    pats = candle_patterns(df)
-    pat_ok, pat_txt = False, "none in the last 3 bars"
-    for i in range(len(df) - 3, len(df)):
-        if i in pats:
-            b = df.iloc[i]
-            if at_level(float(b["Low"]), float(b["High"]), all_levels):
-                pat_ok, pat_txt = True, f"{pats[i][0]} at a level"
+    bull = [0] * 6
+    bear = [0] * 6
+    bd: list[list[str]] = [[] for _ in range(6)]
+    rd: list[list[str]] = [[] for _ in range(6)]
+
+    # Tier 1 — location & structure (30): where price sits vs the levels
+    if pa:
+        if price > pa["PDH"]:
+            bull[0] += 8
+            bd[0].append("above PDH")
+        elif price < pa["PDL"]:
+            bear[0] += 8
+            rd[0].append("below PDL")
+        if price > pa["PDC"]:
+            bull[0] += 8
+            bd[0].append("above prior close")
+        elif price < pa["PDC"]:
+            bear[0] += 8
+            rd[0].append("below prior close")
+    if orng:
+        if price > orng["high"]:
+            bull[0] += 6
+            bd[0].append("above the opening range")
+        elif price < orng["low"]:
+            bear[0] += 6
+            rd[0].append("below the opening range")
+    zone_done = False
+    for z in zones:
+        if z["low"] <= price <= z["high"]:
+            if z["hi_idx"] and z["lo_idx"] \
+                    and min(z["hi_idx"]) < max(z["lo_idx"]):
+                bull[0] += 8
+                bd[0].append("inside a flipped-resistance BUYING ZONE")
+            elif z["hi_idx"] and z["lo_idx"] \
+                    and min(z["lo_idx"]) < max(z["hi_idx"]):
+                bear[0] += 8
+                rd[0].append("inside a flipped-support SELLING ZONE")
+            elif z["center"] <= price:
+                bull[0] += 8
+                bd[0].append("inside a BUYING ZONE")
             else:
-                pat_txt = f"{pats[i][0]} (not at a level)"
-    checks.append((f"Candlestick formation at a level — {pat_txt}", pat_ok))
-    k, d = df["StochK"], df["StochD"]
-    scross = False
-    for i in range(len(df) - 5, len(df)):
-        if (k.iloc[i - 1] <= d.iloc[i - 1] and k.iloc[i] > d.iloc[i]) or \
-           (k.iloc[i - 1] >= d.iloc[i - 1] and k.iloc[i] < d.iloc[i]):
-            scross = True
-    checks.append(("Stochastic %K/%D cross in the last 5 bars", scross))
+                bear[0] += 8
+                rd[0].append("inside a SELLING ZONE")
+            zone_done = True
+            break
+    if not zone_done:
+        below = [z for z in zones if z["center"] < price]
+        above = [z for z in zones if z["center"] >= price]
+        if below and price - below[-1]["high"] <= 0.003 * price:
+            bull[0] += 8
+            bd[0].append("resting on a BUYING ZONE")
+        elif above and above[0]["low"] - price <= 0.003 * price:
+            bear[0] += 8
+            rd[0].append("pressed under a SELLING ZONE")
+
+    # Tier 2 — intraday trend (25): EMA 9/21 alignment + VWAP side
+    e9, e21, vwap = last["EMA9"], last["EMA21"], last["VWAP"]
+    if pd.notna(e9) and pd.notna(e21):
+        if e9 > e21:
+            bull[1] += 15
+            bd[1].append("EMA 9 above 21")
+        elif e9 < e21:
+            bear[1] += 15
+            rd[1].append("EMA 9 below 21")
+    if pd.notna(vwap):
+        if price > vwap:
+            bull[1] += 10
+            bd[1].append("above VWAP")
+        elif price < vwap:
+            bear[1] += 10
+            rd[1].append("below VWAP")
+
+    # Tier 3 — volume (15): graded by relative volume, credited to the
+    # direction of the last-5-bar move it is funding
     vol = df["Volume"]
     recent = float(vol.iloc[-5:].mean())
-    base = float(vol.iloc[-25:-5].mean()) if len(vol) >= 25 else 0.0
-    checks.append((f"Volume confirming (last 5 bars "
-                   f"{recent / base:.2f}x the prior 20)" if base > 0
-                   else "Volume confirming", base > 0 and recent >= 1.3 * base))
-    return checks
+    base = float(vol.iloc[-25:-5].mean())
+    if base > 0:
+        rv = recent / base
+        pts = 15 if rv >= 1.5 else 12 if rv >= 1.3 else \
+            9 if rv >= 1.15 else 6 if rv >= 1.0 else 2
+        move = price - float(df["Close"].iloc[-6])
+        if move > 0:
+            bull[2] += pts
+            bd[2].append(f"{rv:.2f}x volume behind the last-5-bar rise")
+        elif move < 0:
+            bear[2] += pts
+            rd[2].append(f"{rv:.2f}x volume behind the last-5-bar fall")
+
+    # Tier 4 — pattern & candle at a level (10)
+    for pat in chart_pats:
+        if pat["bias"] in ("bull", "bear"):
+            pts = 7 if "CONFIRMED" in pat["status"] else \
+                5 if pat["status"] == "ACTIVE" else 4
+            if pat["bias"] == "bull":
+                bull[3] += pts
+                bd[3].append(f"{pat['name']} — {pat['status']}")
+            else:
+                bear[3] += pts
+                rd[3].append(f"{pat['name']} — {pat['status']}")
+            break
+    pats = candle_patterns(df)
+    for i in range(len(df) - 3, len(df)):
+        if i in pats and pats[i][1] in ("bull", "bear"):
+            b = df.iloc[i]
+            if at_level(float(b["Low"]), float(b["High"]), levels):
+                if pats[i][1] == "bull":
+                    bull[3] += 3
+                    bd[3].append(f"{pats[i][0]} at a level")
+                else:
+                    bear[3] += 3
+                    rd[3].append(f"{pats[i][0]} at a level")
+                break
+    bull[3] = min(bull[3], 10)
+    bear[3] = min(bear[3], 10)
+
+    # Tier 5 — stochastic trigger (10): a fresh cross, else %K/%D side
+    k, d = df["StochK"], df["StochD"]
+    scross = None
+    for i in range(max(1, len(df) - 5), len(df)):
+        if pd.notna(k.iloc[i - 1]) and pd.notna(k.iloc[i]) \
+                and pd.notna(d.iloc[i - 1]) and pd.notna(d.iloc[i]):
+            if k.iloc[i - 1] <= d.iloc[i - 1] and k.iloc[i] > d.iloc[i]:
+                scross = "up"
+            elif k.iloc[i - 1] >= d.iloc[i - 1] and k.iloc[i] < d.iloc[i]:
+                scross = "down"
+    if scross == "up":
+        bull[4] += 10
+        bd[4].append("%K crossed up in the last 5 bars")
+    elif scross == "down":
+        bear[4] += 10
+        rd[4].append("%K crossed down in the last 5 bars")
+    elif pd.notna(k.iloc[-1]) and pd.notna(d.iloc[-1]):
+        if k.iloc[-1] > d.iloc[-1]:
+            bull[4] += 5
+            bd[4].append("%K above %D")
+        elif k.iloc[-1] < d.iloc[-1]:
+            bear[4] += 5
+            rd[4].append("%K below %D")
+
+    # Tier 6 — session context (10): PCR zone (the user's bands; the
+    # oversold/overbought extremes score as reversal evidence) + a fresh
+    # 9/21 EMA cross in the last 10 bars
+    if pcr_label:
+        if pcr_label.startswith("Bullish"):
+            bull[5] += 6
+            bd[5].append("PCR in the bullish zone")
+        elif pcr_label.startswith("Oversold"):
+            bull[5] += 6
+            bd[5].append("PCR oversold — reversal evidence")
+        elif pcr_label.startswith("Bearish"):
+            bear[5] += 6
+            rd[5].append("PCR in the bearish zone")
+        elif pcr_label.startswith("Overbought"):
+            bear[5] += 6
+            rd[5].append("PCR overbought — reversal evidence")
+    ecross = None
+    e9s, e21s = df["EMA9"], df["EMA21"]
+    for i in range(max(1, len(df) - 10), len(df)):
+        if pd.notna(e9s.iloc[i - 1]) and pd.notna(e9s.iloc[i]):
+            if e9s.iloc[i - 1] <= e21s.iloc[i - 1] \
+                    and e9s.iloc[i] > e21s.iloc[i]:
+                ecross = "up"
+            elif e9s.iloc[i - 1] >= e21s.iloc[i - 1] \
+                    and e9s.iloc[i] < e21s.iloc[i]:
+                ecross = "down"
+    if ecross == "up":
+        bull[5] += 4
+        bd[5].append("fresh 9/21 cross up (last 10 bars)")
+    elif ecross == "down":
+        bear[5] += 4
+        rd[5].append("fresh 9/21 cross down (last 10 bars)")
+
+    bt, rt = sum(bull), sum(bear)
+    direction = "Bullish" if bt > rt + 5 else \
+        "Bearish" if rt > bt + 5 else "Mixed"
+    score = round(100 * max(bt, rt) / (100 if pcr_label else 94))
+    conflict = (bull[0] - bear[0]) * (bull[1] - bear[1]) < 0 \
+        and abs(bull[0] - bear[0]) >= 8 and abs(bull[1] - bear[1]) >= 10
+    rows = []
+    for t, (name, w) in enumerate(TIER_WEIGHTS):
+        if direction == "Bullish":
+            pts, det = bull[t], bd[t]
+        elif direction == "Bearish":
+            pts, det = bear[t], rd[t]
+        else:
+            pts, det = max(bull[t], bear[t]), (bd[t] or rd[t])
+        rows.append((f"Tier {t + 1} · {name} ({w}%)", pts, w,
+                     "; ".join(det) if det else "no evidence either way"))
+    notes = []
+    if conflict:
+        notes.append("⚠ Tier 1 (structure) and Tier 2 (trend) disagree — "
+                     "by the hierarchy that is a no-directional-call "
+                     "setup, whatever the total says.")
+    kk = float(last["StochK"]) if pd.notna(last["StochK"]) else None
+    if direction == "Bullish" and kk is not None and kk >= 80:
+        notes.append("⚠ Filter check: %K ≥ 80 — momentum is stretched. "
+                     "Extremes can pin in a strong trend, but chasing "
+                     "here carries reversal risk.")
+    if direction == "Bearish" and kk is not None and kk <= 20:
+        notes.append("⚠ Filter check: %K ≤ 20 — momentum is stretched "
+                     "to the downside; pressing shorts here carries "
+                     "squeeze risk.")
+    if not pcr_label:
+        notes.append("PCR unavailable for this symbol — Tier 6 scored "
+                     "out of 4 and the total re-based to 100.")
+    return {"direction": direction, "score": score, "bull": bt,
+            "bear": rt, "conflict": conflict, "rows": rows,
+            "notes": notes}
 
 
 # ---------------------------------------------------------------- PCR
@@ -1418,6 +1609,12 @@ def render():
         + [z["center"] for z in zones] \
         + ([orng["high"], orng["low"]] if orng else [])
 
+    # The PCR chain is fetched before the metrics: its zone feeds Tier 6
+    # of the weighted confluence, so the header score and the checklist
+    # under the chart are one computation. (Slow 300s bucket — the chain
+    # pull takes a few seconds and PCR does not need the fast cycle.)
+    p = fetch_pcr(symbol, _bucket(live, int(refresh_secs), bucket_secs=300))
+
     last = disp.iloc[-1]
     prev_close = pa["PDC"] if pa else float(disp["Close"].iloc[0])
     chg = (float(last["Close"]) / prev_close - 1) * 100 if prev_close else 0.0
@@ -1429,10 +1626,12 @@ def render():
     c3.metric("Stochastic %K / %D",
               f"{float(last['StochK']):.0f} / {float(last['StochD']):.0f}"
               if pd.notna(last["StochK"]) else "—")
-    checks = confluence(disp, zones, level_vals)
-    score = sum(1 for _, ok in checks if ok)
-    c4.metric("Confluence (book stack)",
-              f"{score} / {len(checks)}" if checks else "—")
+    wconf = weighted_confluence(
+        disp, zones, level_vals, pa, orng, chart_pats,
+        pcr_zone(p["pcr"])[0] if p is not None else None)
+    c4.metric("Weighted confluence",
+              f"{wconf['score']} / 100" if wconf else "—",
+              wconf["direction"] if wconf else None, delta_color="off")
 
     trailing = CHART_TF_TRAILING[chart_tf]
     window_start = (disp.index[-1] - pd.Timedelta(minutes=trailing)
@@ -1468,9 +1667,7 @@ def render():
                        "contained pause, or a clean stepping sequence — it "
                        "does not force a pattern onto ordinary noise.")
 
-    # Put/Call Ratio strip (user's bands) — slow bucket: PCR does not need
-    # the fast refresh cycle, and the chain pull takes a few seconds.
-    p = fetch_pcr(symbol, _bucket(live, int(refresh_secs), bucket_secs=300))
+    # Put/Call Ratio strip (user's bands) — chain fetched above.
     if p is not None:
         zlabel, _zcolor = pcr_zone(p["pcr"])
         pc1, pc2 = st.columns([1, 3])
@@ -1491,11 +1688,21 @@ def render():
                    "requirements.txt and reboot).")
     else:
         st.caption(f"PCR unavailable for {symbol} — no options chain data.")
-    if checks:
-        st.markdown("**Confluence checklist** (the book's Premium stack, "
-                    "at the last bar):")
-        st.markdown("\n".join(
-            f"- {'✅' if ok else '⬜'} {label}" for label, ok in checks))
+    if wconf:
+        st.markdown("**Weighted confluence** (at the last bar — tiers "
+                    "in priority order, higher tiers overrule lower "
+                    "ones; both directions scored, the larger total "
+                    "is the lean):")
+        lines = []
+        for label, pts, w, det in wconf["rows"]:
+            icon = "✅" if pts >= 0.6 * w else "🟡" if pts > 0 else "⬜"
+            lines.append(f"- {icon} **{label}** — {pts}/{w} pts · {det}")
+        lines.append(f"- **Lean: {wconf['direction']} "
+                     f"{wconf['score']}/100** (bull {wconf['bull']} · "
+                     f"bear {wconf['bear']})")
+        st.markdown("\n".join(lines))
+        for note in wconf["notes"]:
+            st.caption(note)
     st.caption(
         f"Alpaca {str(_feed).upper()} · {len(df1):,} 1-min bars loaded "
         f"({dates[0]} → {dates[-1]}) · showing {len(disp):,} {tf_label} bars "
@@ -1553,4 +1760,13 @@ with st.expander("How to read this chart"):
         "Under 0.7 = oversold, reversal watch · 0.7–0.9 = bearish zone · "
         "0.9–1.1 = sideways · 1.1–1.6 = bullish zone · over 1.6 = overbought, "
         "reversal watch. Volume PCR builds during the session, so the first "
-        "hour's reading rests on thin volume.")
+        "hour's reading rests on thin volume.\n"
+        "- **Weighted confluence** — the score and checklist under the "
+        "chart weight the indicator hierarchy instead of counting checks "
+        "flat: location & structure 30%, intraday trend (EMA 9/21 + VWAP) "
+        "25%, volume 15%, pattern & candle at a level 10%, stochastic "
+        "trigger 10%, session context (PCR zone + fresh EMA cross) 10%. "
+        "Bullish and bearish evidence are scored separately and the "
+        "bigger total is the lean; when Tier 1 and Tier 2 disagree the "
+        "checklist flags it — by the hierarchy, that's a "
+        "no-directional-call setup.")
