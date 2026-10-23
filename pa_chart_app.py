@@ -13,7 +13,8 @@ book (@FORRNEERO), drawn on the chart for any US stock:
   * CANDLESTICK FORMATIONS marked where they occur — highlighted ONLY when
     they form AT a level (the book's core rule: a candle mid-chart means
     nothing); mid-chart formations are drawn faint
-  * MOVING AVERAGES — EMA 9 / 21 (the book's crossover pair) + session VWAP
+  * MOVING AVERAGES — EMA 9 / 21 (the book's crossover pair), EMA 50 / 200
+    trend-context lines (sidebar toggle), + session VWAP
   * Prior-day levels (the book's AHPMB levels): PDH / PDC / PDL, and the
     30-minute opening range
   * STOCHASTIC %K / %D — the book's momentum-shift gauge (bottom panel)
@@ -175,12 +176,16 @@ def stoch_kd(high: pd.Series, low: pd.Series, close: pd.Series,
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """EMA 9/21, session-anchored VWAP, stochastic — computed per session on
-    the frame as given (for 1-min frames the VWAP is the exact session VWAP;
-    on resampled frames it is the standard resampled approximation)."""
+    """EMA 9/21/50/200, session-anchored VWAP, stochastic — computed on
+    the frame as given (for 1-min frames the VWAP is the exact session
+    VWAP; on resampled frames it is the standard resampled
+    approximation). The EMAs run across the whole loaded frame, so the
+    50/200 arrive at today's open already warmed by the prior sessions."""
     df = df.copy()
     df["EMA9"] = ema(df["Close"], 9)
     df["EMA21"] = ema(df["Close"], 21)
+    df["EMA50"] = ema(df["Close"], 50)
+    df["EMA200"] = ema(df["Close"], 200)
     dates = df.index.date
     df["_d"] = dates
     tp = (df["High"] + df["Low"] + df["Close"]) / 3.0
@@ -1279,7 +1284,8 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
                 levels: list[float], pa: dict | None, orng: dict | None,
                 show: dict, window_start=None,
                 chart_patterns: list[dict] | None = None) -> go.Figure:
-    """3 panels: price (candles, EMA 9/21, VWAP, zones, trendlines, PDH/PDC/
+    """3 panels: price (candles, EMA 9/21/50/200, VWAP, zones, trendlines,
+    PDH/PDC/
     PDL, opening range, pattern markers, time-cycle phases), volume,
     stochastic."""
     price = float(df["Close"].iloc[-1])
@@ -1298,6 +1304,13 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
                              line=dict(width=1.4, color="#f59e0b")), row=1, col=1)
     fig.add_trace(go.Scatter(x=x, y=df["EMA21"], name="EMA 21",
                              line=dict(width=1.4, color="#2563eb")), row=1, col=1)
+    if show.get("ema_long"):
+        fig.add_trace(go.Scatter(x=x, y=df["EMA50"], name="EMA 50",
+                                 line=dict(width=1.2, color="#db2777")),
+                      row=1, col=1)
+        fig.add_trace(go.Scatter(x=x, y=df["EMA200"], name="EMA 200",
+                                 line=dict(width=1.8, color="#1f2937")),
+                      row=1, col=1)
     fig.add_trace(go.Scatter(x=x, y=df["VWAP"], name="VWAP",
                              line=dict(width=1.2, color="#7c3aed", dash="dash")),
                   row=1, col=1)
@@ -1513,7 +1526,7 @@ st.set_page_config(page_title="Price-Action Charting", layout="wide")
 st.title("📐 Price-Action Charting")
 st.caption("The charting techniques from the *Price Action Trading* book — "
            "zones, trendlines, chart-pattern recognition, formations at "
-           "levels, EMA 9/21, stochastic — drawn on any US stock. "
+           "levels, EMA 9/21/50/200, stochastic — drawn on any US stock. "
            "Display only: no verdicts, no signals.")
 
 _key, _secret, _feed = _secrets()
@@ -1557,6 +1570,7 @@ with st.sidebar:
             "pennants, staircases)", value=True),
         "patterns": st.checkbox("Candlestick formations", value=True),
         "phases": st.checkbox("Time-cycle phases", value=True),
+        "ema_long": st.checkbox("EMA 50 / 200 (trend context)", value=True),
     }
     st.caption("Formations are labeled only when they form AT a level "
                "(zone, PDH/PDC/PDL, opening-range edge) — the book's rule. "
@@ -1752,6 +1766,14 @@ with st.expander("How to read this chart"):
         "- **Shaded bands** — time-cycle phases of the session: the opening "
         "drive (first hour), the midday lull, and the final hour, when moves "
         "tend to start or exhaust.\n"
+        "- **EMA lines** — 9 (amber) and 21 (blue) are the book's "
+        "crossover pair; 50 (pink) and 200 (dark) are trend context at "
+        "the chosen bar size, warmed up on the loaded prior sessions "
+        "like the stochastic — on 1-minute bars the 200 spans roughly "
+        "the last 3⅓ hours, on 5-minute bars roughly the last 2½ "
+        "sessions. Price holding above both is the wind at a long's "
+        "back; below both, at a short's. Toggle them off in the sidebar "
+        "(Show → EMA 50 / 200) if the chart feels crowded.\n"
         "- **Stochastic (bottom)** — momentum shifts: blue %K crossing orange "
         "%D is the event; crossing up from under 20 or down from over 80 is "
         "the one that matters, especially right at a level.\n"
