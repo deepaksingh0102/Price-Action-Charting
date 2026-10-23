@@ -130,16 +130,31 @@ def _bucket(live: bool, refresh_secs: int,
 
 @st.cache_data(show_spinner=False)
 def fetch_bars_1m(symbol: str, bucket: int = 0,
-                  days: int = LOAD_DAYS) -> pd.DataFrame:
+                  days: int = LOAD_DAYS, end: str = "") -> pd.DataFrame:
     """Last `days` calendar days of 1-minute bars, regular hours only
-    (09:30-16:00 ET), paginated (Alpaca's limit is per page)."""
+    (09:30-16:00 ET), paginated (Alpaca's limit is per page). `end`
+    (an ET date, "YYYY-MM-DD") anchors the window to a past session for
+    the date view: bars through the end of that date are loaded, so the
+    selected session is the frame's last session and the usual warm-up
+    and prior-day logic apply to it unchanged."""
     _, _, feed = _secrets()
-    start = (datetime.now(ET) - timedelta(days=days)).strftime(
-        "%Y-%m-%dT00:00:00Z")
+    end_param = None
+    if end:
+        end_et = datetime.strptime(end, "%Y-%m-%d").replace(
+            tzinfo=ET) + timedelta(days=1)
+        start = (end_et - timedelta(days=days)).astimezone(
+            ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_param = end_et.astimezone(
+            ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
+    else:
+        start = (datetime.now(ET) - timedelta(days=days)).strftime(
+            "%Y-%m-%dT00:00:00Z")
     rows, token = [], None
     while True:
         params = {"timeframe": "1Min", "start": start, "limit": 10000,
                   "feed": feed, "sort": "asc", "adjustment": "split"}
+        if end_param:
+            params["end"] = end_param
         if token:
             params["page_token"] = token
         data = alpaca_get(f"/stocks/{symbol}/bars", params)
@@ -1539,6 +1554,16 @@ if not _key or not _secret:
 with st.sidebar:
     st.header("Chart")
     symbol = st.text_input("Stock symbol", value="AAPL").strip().upper() or "AAPL"
+    _today_et = datetime.now(ET).date()
+    view_date = st.date_input(
+        "Session date", value=_today_et, max_value=_today_et,
+        min_value=_today_et - timedelta(days=365),
+        help="Pick a past trading day to view that session's chart — "
+             "zones, patterns, formations and the weighted confluence "
+             "are computed for that session, with its own prior-day "
+             "levels. PCR is live-only and shows as unavailable for "
+             "past dates. Pick today to return to the live chart.")
+    past_mode = bool(view_date) and view_date < _today_et
     tf_label = st.selectbox("Bar size", ["1 min", "5 min", "15 min"], index=0)
     chart_tf = st.selectbox(
         "Chart timeframe",
@@ -1587,7 +1612,9 @@ def in_market_hours(now: datetime | None = None) -> bool:
 
 def render():
     try:
-        df1 = fetch_bars_1m(symbol, _bucket(live, int(refresh_secs)))
+        df1 = fetch_bars_1m(
+            symbol, _bucket(live, int(refresh_secs)),
+            end=view_date.isoformat() if past_mode else "")
     except Exception as e:
         st.error(f"Could not load bars for {symbol}: {e}")
         return
@@ -1595,7 +1622,14 @@ def render():
         st.info(f"Not enough intraday data for {symbol} yet.")
         return
     dates = sorted(set(df1.index.date))
-    df = df1[df1.index.normalize() == pd.Timestamp(dates[-1], tz=ET)]
+    if past_mode and view_date not in dates:
+        st.info(f"No trading session for {symbol} on {view_date} — the "
+                f"market was closed that day, or the symbol did not "
+                f"trade. Sessions in the loaded window: "
+                f"{dates[0]} → {dates[-1]}. Pick one of those dates.")
+        return
+    sel_date = view_date if past_mode else dates[-1]
+    df = df1[df1.index.normalize() == pd.Timestamp(sel_date, tz=ET)]
     minutes = {"1 min": 1, "5 min": 5, "15 min": 15}[tf_label]
     # Indicators are computed on the FULL multi-day frame at the chosen bar
     # size, then sliced to today — the analyzer's warm-up rule. Computing
@@ -1606,14 +1640,14 @@ def render():
     # VWAP still resets each session (it is grouped by date).
     full_disp = add_indicators(resample(df1, minutes))
     disp = full_disp[full_disp.index.normalize()
-                     == pd.Timestamp(dates[-1], tz=ET)]
+                     == pd.Timestamp(sel_date, tz=ET)]
     if len(disp) < 10:
         st.info("Only the first few bars of the session so far — the chart "
                 "builds as bars arrive.")
         return
 
     pa = prior_day_levels(df1)
-    today_df = df1[df1.index.date == dates[-1]]
+    today_df = df1[df1.index.date == sel_date]
     orng = opening_range(today_df)
     zones = sr_zones(disp)
     lines = trendlines(disp)
@@ -1627,7 +1661,8 @@ def render():
     # of the weighted confluence, so the header score and the checklist
     # under the chart are one computation. (Slow 300s bucket — the chain
     # pull takes a few seconds and PCR does not need the fast cycle.)
-    p = fetch_pcr(symbol, _bucket(live, int(refresh_secs), bucket_secs=300))
+    p = None if past_mode else fetch_pcr(
+        symbol, _bucket(live, int(refresh_secs), bucket_secs=300))
 
     last = disp.iloc[-1]
     prev_close = pa["PDC"] if pa else float(disp["Close"].iloc[0])
@@ -1682,7 +1717,11 @@ def render():
                        "does not force a pattern onto ordinary noise.")
 
     # Put/Call Ratio strip (user's bands) — chain fetched above.
-    if p is not None:
+    if past_mode:
+        st.caption(f"Put/Call Ratio is live-only — not available for "
+                   f"the {sel_date} session. The weighted confluence "
+                   f"above is re-based without it.")
+    elif p is not None:
         zlabel, _zcolor = pcr_zone(p["pcr"])
         pc1, pc2 = st.columns([1, 3])
         with pc1:
@@ -1719,13 +1758,19 @@ def render():
             st.caption(note)
     st.caption(
         f"Alpaca {str(_feed).upper()} · {len(df1):,} 1-min bars loaded "
-        f"({dates[0]} → {dates[-1]}) · showing {len(disp):,} {tf_label} bars "
+        f"({dates[0]} → {dates[-1]}) · session {sel_date} · "
+        f"showing {len(disp):,} {tf_label} bars "
         f"· window: {chart_tf} · "
         f"updated {datetime.now(ET).strftime('%H:%M:%S')} ET · "
         f"build {BUILD_TAG} · {BUILD_HASH}")
 
 
-if live and in_market_hours():
+if past_mode:
+    render()
+    st.caption(f"Viewing the {view_date} session — live tracking is "
+               f"paused in date view. Set the Session date back to "
+               f"today for the live chart.")
+elif live and in_market_hours():
     st.fragment(run_every=int(refresh_secs))(render)()
 elif live:
     render()
