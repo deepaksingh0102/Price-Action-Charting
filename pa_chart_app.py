@@ -17,6 +17,10 @@ book (@FORRNEERO), drawn on the chart for any US stock:
     trend-context lines (sidebar toggle), + session VWAP
   * Prior-day levels (the book's AHPMB levels): PDH / PDC / PDL, and the
     30-minute opening range
+  * SESSION VOLUME PROFILE — the day's volume by price level (24 bins
+    at the chosen bar size): the point of control (POC, most volume
+    traded) and the 70% value area (VAH/VAL), drawn as a histogram on
+    the right of the price panel. Display only — no score, no signal.
   * STOCHASTIC %K / %D — the book's momentum-shift gauge (bottom panel)
   * TIME CYCLES — the book names the technique but gives no method; this app
     draws the intraday session phases (opening drive / first hour, midday,
@@ -56,7 +60,7 @@ ALPACA_BASE = "https://data.alpaca.markets/v2"
 # Version stamp: the footer shows this tag plus a hash computed live from
 # the deployed file itself, so the page proves which build is running —
 # compare it with the hash named when the file was delivered.
-BUILD_TAG = "2026-10-23"
+BUILD_TAG = "2026-11-06"
 
 
 def _build_hash() -> str:
@@ -246,6 +250,63 @@ def opening_range(df_day: pd.DataFrame, minutes: int = 30) -> dict | None:
     if orb.empty:
         return None
     return {"high": float(orb["High"].max()), "low": float(orb["Low"].min())}
+
+
+def session_volume_profile(df_day: pd.DataFrame, n_bins: int = 24,
+                           va_pct: float = 0.70) -> dict | None:
+    """Session volume profile from the session's displayed bars.
+
+    Each bar's volume is assigned to the price bin holding its typical
+    price (H+L+C)/3 — the standard bar-based approximation of the
+    trade-by-trade profile. POC is the bin with the most volume; the
+    value area is the contiguous range around the POC holding `va_pct`
+    of the session's volume, grown outward one adjacent bin at a time
+    (always taking the higher-volume side first).
+
+    Computed on the full session at the chosen bar size, like the zones
+    and trendlines — the visible window only crops the chart, never the
+    profile. Display only — no score, no signal. Returns None when the
+    session has no usable price range or no volume.
+    """
+    if df_day is None or df_day.empty or len(df_day) < 2:
+        return None
+    lo = float(df_day["Low"].min())
+    hi = float(df_day["High"].max())
+    vol = df_day["Volume"].to_numpy(dtype=float)
+    total = float(vol.sum())
+    if total <= 0 or not (hi > lo):
+        return None
+    n = max(2, min(n_bins, len(df_day)))
+    edges = np.linspace(lo, hi, n + 1)
+    tp = ((df_day["High"] + df_day["Low"] + df_day["Close"]) / 3.0
+          ).to_numpy(dtype=float)
+    idx = np.clip(np.searchsorted(edges, tp, side="right") - 1, 0, n - 1)
+    bin_vol = np.bincount(idx, weights=vol, minlength=n)
+    if bin_vol.max() <= 0:
+        return None
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    poc_i = int(np.argmax(bin_vol))
+    # Value area: grow from the POC, always taking the higher-volume
+    # adjacent bin, until va_pct of the session's volume is inside.
+    lo_i = hi_i = poc_i
+    inside = float(bin_vol[poc_i])
+    while inside < va_pct * total and (lo_i > 0 or hi_i < n - 1):
+        up = bin_vol[hi_i + 1] if hi_i < n - 1 else -1.0
+        dn = bin_vol[lo_i - 1] if lo_i > 0 else -1.0
+        if up >= dn:
+            hi_i += 1
+            inside += float(bin_vol[hi_i])
+        else:
+            lo_i -= 1
+            inside += float(bin_vol[lo_i])
+    return {
+        "centers": centers, "volumes": bin_vol,
+        "bin_width": float(edges[1] - edges[0]),
+        "poc_i": poc_i, "poc": float(centers[poc_i]),
+        "vah": float(edges[hi_i + 1]), "val": float(edges[lo_i]),
+        "total_volume": total, "va_volume": inside,
+        "n_bins": n,
+    }
 
 
 # ---------------------------------------------------------------- swings, zones, trendlines
@@ -1298,11 +1359,12 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
                 lines: list[dict], pats: dict[int, tuple[str, str]],
                 levels: list[float], pa: dict | None, orng: dict | None,
                 show: dict, window_start=None,
-                chart_patterns: list[dict] | None = None) -> go.Figure:
+                chart_patterns: list[dict] | None = None,
+                vp: dict | None = None) -> go.Figure:
     """3 panels: price (candles, EMA 9/21/50/200, VWAP, zones, trendlines,
     PDH/PDC/
-    PDL, opening range, pattern markers, time-cycle phases), volume,
-    stochastic."""
+    PDL, opening range, pattern markers, time-cycle phases, session
+    volume profile), volume, stochastic."""
     price = float(df["Close"].iloc[-1])
     fig = make_subplots(
         rows=3, cols=1, shared_xaxes=True,
@@ -1533,6 +1595,49 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
                 ylo = min(ylo, v - pad * 0.5)
                 yhi = max(yhi, v + pad * 0.5)
         fig.update_yaxes(range=[ylo, yhi], row=1, col=1)
+
+    # Session volume profile: horizontal histogram on the price panel,
+    # drawn on a secondary x-axis (x2) that overlays the right-hand
+    # fifth of the panel, so it never collides with the candles. The
+    # POC bin is amber; POC is the amber line, VAH/VAL bracket the 70%
+    # value area. This block runs AFTER the window-range update above
+    # on purpose: update_xaxes(range=...) applies to every x-axis
+    # present, and x2's range is a volume scale, not a time scale.
+    if show.get("volume_profile") and vp is not None:
+        vols = vp["volumes"]
+        m = float(vols.max())
+        if m > 0:
+            colors = ["rgba(245, 158, 11, 0.55)"
+                      if i == vp["poc_i"] else "rgba(37, 99, 235, 0.30)"
+                      for i in range(len(vols))]
+            fig.add_trace(go.Bar(
+                y=vp["centers"], x=vols, orientation="h",
+                width=vp["bin_width"] * 0.9, marker_color=colors,
+                name="Volume profile", showlegend=True,
+                hovertemplate="Price %{y:,.2f}<br>Volume %{x:,.0f}"
+                              "<extra></extra>"),
+                row=1, col=1)
+            fig.data[-1].update(xaxis="x2")
+            fig.update_layout(
+                xaxis2=dict(overlaying="x", side="top",
+                            range=[-4 * m, m], showgrid=False,
+                            showticklabels=False, zeroline=False,
+                            fixedrange=True))
+            fig.add_hline(y=vp["poc"], line_dash="solid",
+                          line_color="#f59e0b", line_width=1.6,
+                          row=1, col=1,
+                          annotation_text=f"POC {vp['poc']:,.2f}",
+                          annotation_position="top right")
+            fig.add_hline(y=vp["vah"], line_dash="dot",
+                          line_color="#9ca3af", line_width=1.2,
+                          row=1, col=1,
+                          annotation_text=f"VAH {vp['vah']:,.2f}",
+                          annotation_position="top left")
+            fig.add_hline(y=vp["val"], line_dash="dot",
+                          line_color="#9ca3af", line_width=1.2,
+                          row=1, col=1,
+                          annotation_text=f"VAL {vp['val']:,.2f}",
+                          annotation_position="bottom left")
     return fig
 
 
@@ -1541,7 +1646,8 @@ st.set_page_config(page_title="Price-Action Charting", layout="wide")
 st.title("📐 Price-Action Charting")
 st.caption("The charting techniques from the *Price Action Trading* book — "
            "zones, trendlines, chart-pattern recognition, formations at "
-           "levels, EMA 9/21/50/200, stochastic — drawn on any US stock. "
+           "levels, EMA 9/21/50/200, session volume profile, stochastic — "
+           "drawn on any US stock. "
            "Display only: no verdicts, no signals.")
 
 _key, _secret, _feed = _secrets()
@@ -1596,6 +1702,8 @@ with st.sidebar:
         "patterns": st.checkbox("Candlestick formations", value=True),
         "phases": st.checkbox("Time-cycle phases", value=True),
         "ema_long": st.checkbox("EMA 50 / 200 (trend context)", value=True),
+        "volume_profile": st.checkbox(
+            "Volume profile (POC / value area)", value=True),
     }
     st.caption("Formations are labeled only when they form AT a level "
                "(zone, PDH/PDC/PDL, opening-range edge) — the book's rule. "
@@ -1651,6 +1759,7 @@ def render():
     orng = opening_range(today_df)
     zones = sr_zones(disp)
     lines = trendlines(disp)
+    vp = session_volume_profile(disp)
     chart_pats = detect_chart_patterns(disp)
     pats = candle_patterns(disp)
     level_vals = ([pa["PDH"], pa["PDC"], pa["PDL"]] if pa else []) \
@@ -1687,9 +1796,26 @@ def render():
                     if trailing is not None else None)
     st.plotly_chart(build_chart(disp, symbol, zones, lines, pats, level_vals,
                                 pa, orng, show, window_start=window_start,
-                                chart_patterns=chart_pats),
+                                chart_patterns=chart_pats, vp=vp),
                     use_container_width=True,
                     key=f"pa_{symbol}_{tf_label}_{chart_tf.replace(' ', '_')}")
+
+    if show.get("volume_profile"):
+        if vp is not None:
+            st.caption(
+                f"Volume profile — session {sel_date}, {tf_label} bars, "
+                f"{vp['n_bins']} price bins: POC "
+                f"${vp['poc']:,.2f} (most volume traded here) · value area "
+                f"${vp['val']:,.2f} – ${vp['vah']:,.2f} "
+                f"({vp['va_volume'] / vp['total_volume']:.0%} of "
+                f"{vp['total_volume']:,.0f} shares). Price holding above "
+                f"the POC with the value area below it is acceptance "
+                f"higher; a close back below the POC after holding above "
+                f"it is the profile's rejection read. Display only — not "
+                f"scored in the weighted confluence.")
+        else:
+            st.caption("Volume profile unavailable for this session — no "
+                       "usable price range or volume.")
 
     if show.get("chart_patterns"):
         st.markdown("**Pattern recognition** (the book's chart patterns — "
@@ -1811,6 +1937,17 @@ with st.expander("How to read this chart"):
         "- **Shaded bands** — time-cycle phases of the session: the opening "
         "drive (first hour), the midday lull, and the final hour, when moves "
         "tend to start or exhaust.\n"
+        "- **Volume profile (right side of the price panel)** — the "
+        "session's volume by price level, in 24 bins at the chosen bar "
+        "size, computed on the full session like the zones. The amber "
+        "line is the POC (point of control — where the most volume "
+        "traded, the session's fair-value anchor); the dotted lines are "
+        "VAH/VAL, the 70% value area holding most of the day's volume. "
+        "Price holding above the POC with the value area below it is "
+        "acceptance higher; a close back below the POC after holding "
+        "above it is the profile's rejection read. Display only — it is "
+        "not scored in the weighted confluence. Toggle it off in the "
+        "sidebar (Show → Volume profile) if the chart feels crowded.\n"
         "- **EMA lines** — 9 (amber) and 21 (blue) are the book's "
         "crossover pair; 50 (pink) and 200 (dark) are trend context at "
         "the chosen bar size, warmed up on the loaded prior sessions "
