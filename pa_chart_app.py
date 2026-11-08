@@ -60,7 +60,7 @@ ALPACA_BASE = "https://data.alpaca.markets/v2"
 # Version stamp: the footer shows this tag plus a hash computed live from
 # the deployed file itself, so the page proves which build is running —
 # compare it with the hash named when the file was delivered.
-BUILD_TAG = "2026-11-06"
+BUILD_TAG = "2026-11-08"
 
 
 def _build_hash() -> str:
@@ -1597,12 +1597,18 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
         fig.update_yaxes(range=[ylo, yhi], row=1, col=1)
 
     # Session volume profile: horizontal histogram on the price panel,
-    # drawn on a secondary x-axis (x2) that overlays the right-hand
+    # drawn on a secondary x-axis (x4) that overlays the right-hand
     # fifth of the panel, so it never collides with the candles. The
     # POC bin is amber; POC is the amber line, VAH/VAL bracket the 70%
-    # value area. This block runs AFTER the window-range update above
-    # on purpose: update_xaxes(range=...) applies to every x-axis
-    # present, and x2's range is a volume scale, not a time scale.
+    # value area. x4 is used on purpose, NOT x2: in this 3-row figure
+    # with shared x-axes, x2 is already the Volume panel's axis and x3
+    # the Stochastic panel's — redefining x2 (as the first version did)
+    # hijacked the shared-x range with a volume scale and pushed the
+    # candles, EMAs, VWAP and volume bars off-screen. x4 is a fresh
+    # overlay axis with no other role.
+    # This block runs AFTER the window-range update above on purpose:
+    # update_xaxes(range=...) applies to every x-axis present, and x4's
+    # range is a volume scale, not a time scale.
     if show.get("volume_profile") and vp is not None:
         vols = vp["volumes"]
         m = float(vols.max())
@@ -1617,9 +1623,9 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
                 hovertemplate="Price %{y:,.2f}<br>Volume %{x:,.0f}"
                               "<extra></extra>"),
                 row=1, col=1)
-            fig.data[-1].update(xaxis="x2")
+            fig.data[-1].update(xaxis="x4")
             fig.update_layout(
-                xaxis2=dict(overlaying="x", side="top",
+                xaxis4=dict(overlaying="x", side="top",
                             range=[-4 * m, m], showgrid=False,
                             showticklabels=False, zeroline=False,
                             fixedrange=True))
