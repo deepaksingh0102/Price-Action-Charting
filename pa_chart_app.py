@@ -1683,21 +1683,20 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
             cands += [pa["PDH"], pa["PDC"], pa["PDL"]]
         if orng:
             cands += [orng["high"], orng["low"]]
-        for v in cands:
-            if base_lo - span <= v <= base_hi + span:
-                ylo = min(ylo, v - pad * 0.5)
-                yhi = max(yhi, v + pad * 0.5)
-        # The daily EMA lines are drawn as traces, so the axis must be
-        # fit to include them — otherwise they sit off-view (the axis is
-        # fit to the visible bars, not autoranged). render() already hid
-        # any line more than DAILY_EMA_MAX_DIST away, so including the
-        # rest here bounds the stretch at that guard.
+        # Daily EMA lines are levels too — they join `cands` and follow
+        # the same one-span rule. (The first version extended the axis
+        # to any drawn daily line, which on a narrow-range day stretched
+        # the panel to 10x the session range and squashed the candles
+        # into a sliver — the Nov 12 AAPL screenshot. Never again.)
         if show.get("daily_ema") and daily_ema:
             for key in ("ema50", "ema200"):
                 v = daily_ema.get(key)
                 if v is not None:
-                    ylo = min(ylo, v - pad * 0.5)
-                    yhi = max(yhi, v + pad * 0.5)
+                    cands.append(v)
+        for v in cands:
+            if base_lo - span <= v <= base_hi + span:
+                ylo = min(ylo, v - pad * 0.5)
+                yhi = max(yhi, v + pad * 0.5)
         fig.update_yaxes(range=[ylo, yhi], row=1, col=1)
 
     # Session volume profile: horizontal histogram on the price panel,
@@ -1907,8 +1906,11 @@ def render():
     # completed session (no lookahead). Fetched only when the toggle is
     # on, on a slow daily bucket (the values change once a day); a failed
     # or too-short pull just skips the lines, never the chart. A line
-    # more than DAILY_EMA_MAX_DIST from the last price is hidden (it
-    # would stretch the price panel) and named in the caption instead.
+    # more than DAILY_EMA_MAX_DIST from the last price is not drawn at
+    # all (too far to be a useful reference); a drawn line extends the
+    # price axis only when it sits within one session-range of the
+    # action, like every other level — farther lines stay off-view until
+    # price approaches them, and the caption names their values.
     daily_levels = None
     daily_ema = None
     daily_ema_skipped: list[tuple[str, float]] = []
@@ -1964,11 +1966,17 @@ def render():
 
     if show.get("daily_ema"):
         if daily_ema:
+            last_px = float(last["Close"])
             parts = []
-            if daily_ema.get("ema50") is not None:
-                parts.append(f"Daily EMA 50 ${daily_ema['ema50']:,.2f}")
-            if daily_ema.get("ema200") is not None:
-                parts.append(f"Daily EMA 200 ${daily_ema['ema200']:,.2f}")
+            for key, label in (("ema50", "Daily EMA 50"),
+                               ("ema200", "Daily EMA 200")):
+                val = daily_ema.get(key)
+                if val is not None:
+                    pct = (val - last_px) / last_px * 100
+                    rel = (f"{abs(pct):.1f}% below price" if pct < -0.05
+                           else f"{abs(pct):.1f}% above price" if pct > 0.05
+                           else "at price")
+                    parts.append(f"{label} ${val:,.2f} ({rel})")
             skipped = ""
             if daily_ema_skipped:
                 skipped = " " + "; ".join(
