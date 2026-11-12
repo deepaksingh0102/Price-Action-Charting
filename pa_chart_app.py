@@ -14,7 +14,10 @@ book (@FORRNEERO), drawn on the chart for any US stock:
     they form AT a level (the book's core rule: a candle mid-chart means
     nothing); mid-chart formations are drawn faint
   * MOVING AVERAGES — EMA 9 / 21 (the book's crossover pair), EMA 50 / 200
-    trend-context lines (sidebar toggle), + session VWAP
+    trend-context lines on the chosen bar size (sidebar toggle), + session
+    VWAP. DAILY EMA 50 / 200 flat reference lines (sidebar toggle) —
+    computed from daily closes through the prior completed session, so
+    the daily clock reads on the intraday chart. Display only.
   * Prior-day levels (the book's AHPMB levels): PDH / PDC / PDL, and the
     30-minute opening range
   * SESSION VOLUME PROFILE — the day's volume by price level (24 bins
@@ -60,7 +63,7 @@ ALPACA_BASE = "https://data.alpaca.markets/v2"
 # Version stamp: the footer shows this tag plus a hash computed live from
 # the deployed file itself, so the page proves which build is running —
 # compare it with the hash named when the file was delivered.
-BUILD_TAG = "2026-11-08"
+BUILD_TAG = "2026-11-12"
 
 
 def _build_hash() -> str:
@@ -74,6 +77,12 @@ def _build_hash() -> str:
 
 BUILD_HASH = _build_hash()
 LOAD_DAYS = 7            # calendar days of 1-min bars (covers ~5 sessions)
+DAILY_EMA_DAYS = 300     # calendar days of daily bars for the daily-EMA
+                         # reference lines (~208 sessions — enough to warm
+                         # a 200-day EMA); the 1-min frame is far too short
+DAILY_EMA_MAX_DIST = 0.15  # a daily-EMA line more than 15% from the last
+                           # price is hidden (it would stretch the price
+                           # panel); its value is still named in the caption
 ZONE_TOL = 0.0015        # 0.15% — prices within this band are "the same level"
 LEVEL_TOL = 0.0020       # 0.20% — a bar is "at" a level within this band
 
@@ -178,6 +187,73 @@ def fetch_bars_1m(symbol: str, bucket: int = 0,
     mins = df.index.hour * 60 + df.index.minute
     df = df[(mins >= 570) & (mins < 960)]          # 09:30 <= t < 16:00 ET
     return df[~df.index.duplicated(keep="last")]
+
+
+@st.cache_data(show_spinner=False)
+def fetch_daily_closes(symbol: str, bucket: int = 0,
+                       days: int = DAILY_EMA_DAYS,
+                       end: str = "") -> pd.Series:
+    """Daily closes for the daily-EMA reference lines — one cheap 1Day-bars
+    pull. The 1-min frame only covers LOAD_DAYS (~5 sessions), far too
+    short for a 200-day EMA, so this is a separate fetch. `end` anchors
+    the window to a past session for the date view, mirroring
+    fetch_bars_1m. The index is the trading date (the UTC calendar date
+    of each daily bar) — that matches the session date in either of
+    Alpaca's daily-bar timestamp conventions."""
+    _, _, feed = _secrets()
+    if end:
+        end_et = datetime.strptime(end, "%Y-%m-%d").replace(
+            tzinfo=ET) + timedelta(days=1)
+        start = (end_et - timedelta(days=days)).astimezone(
+            ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_param = end_et.astimezone(
+            ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
+    else:
+        start = (datetime.now(ET) - timedelta(days=days)).strftime(
+            "%Y-%m-%dT00:00:00Z")
+        end_param = None
+    rows, token = [], None
+    while True:
+        params = {"timeframe": "1Day", "start": start, "limit": 10000,
+                  "feed": feed, "sort": "asc", "adjustment": "split"}
+        if end_param:
+            params["end"] = end_param
+        if token:
+            params["page_token"] = token
+        data = alpaca_get(f"/stocks/{symbol}/bars", params)
+        rows.extend(data.get("bars") or [])
+        token = data.get("next_page_token")
+        if not token:
+            break
+    if not rows:
+        return pd.Series(dtype=float)
+    ts = pd.to_datetime([r["t"] for r in rows], utc=True)
+    closes = pd.Series([float(r["c"]) for r in rows],
+                       index=pd.DatetimeIndex(ts).date)
+    return closes.sort_index()
+
+
+def daily_ema_levels(closes: pd.Series, session_date) -> dict | None:
+    """Daily EMA 50 / 200 as of the last COMPLETED session before
+    `session_date` — the session's own close is not known while it is
+    trading (and in date view it is the day being replayed), so it is
+    excluded: no lookahead. An EMA draws only when enough closes warmed
+    it (EMA 50 needs >= 50 closes, EMA 200 needs >= 200); None when
+    neither qualifies."""
+    if closes is None or len(closes) < 2:
+        return None
+    prior = closes[[d < session_date for d in closes.index]]
+    n = len(prior)
+    if n < 2:
+        return None
+    out = {"asof": prior.index[-1], "n": n, "ema50": None, "ema200": None}
+    if n >= 50:
+        out["ema50"] = float(ema(prior, 50).iloc[-1])
+    if n >= 200:
+        out["ema200"] = float(ema(prior, 200).iloc[-1])
+    if out["ema50"] is None and out["ema200"] is None:
+        return None
+    return out
 
 
 # ---------------------------------------------------------------- indicators
@@ -1360,11 +1436,12 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
                 levels: list[float], pa: dict | None, orng: dict | None,
                 show: dict, window_start=None,
                 chart_patterns: list[dict] | None = None,
-                vp: dict | None = None) -> go.Figure:
-    """3 panels: price (candles, EMA 9/21/50/200, VWAP, zones, trendlines,
-    PDH/PDC/
-    PDL, opening range, pattern markers, time-cycle phases, session
-    volume profile), volume, stochastic."""
+                vp: dict | None = None,
+                daily_ema: dict | None = None) -> go.Figure:
+    """3 panels: price (candles, EMA 9/21/50/200, VWAP, daily EMA 50/200
+    reference lines, zones, trendlines, PDH/PDC/PDL, opening range,
+    pattern markers, time-cycle phases, session volume profile), volume,
+    stochastic."""
     price = float(df["Close"].iloc[-1])
     fig = make_subplots(
         rows=3, cols=1, shared_xaxes=True,
@@ -1388,6 +1465,22 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
         fig.add_trace(go.Scatter(x=x, y=df["EMA200"], name="EMA 200",
                                  line=dict(width=1.8, color="#1f2937")),
                       row=1, col=1)
+    # Daily EMA 50/200 reference lines: flat lines from daily closes
+    # (completed sessions only) — the daily clock, not the bar-size
+    # clock. Same colours as the intraday EMA 50/200 so the colour
+    # language matches; flat + "(daily)" tells them apart. Two-point
+    # traces, so they appear in the legend with their values.
+    if show.get("daily_ema") and daily_ema:
+        for key, color, width in (("ema50", "#db2777", 2.2),
+                                  ("ema200", "#1f2937", 2.2)):
+            val = daily_ema.get(key)
+            if val is None:
+                continue
+            fig.add_trace(go.Scatter(
+                x=[x[0], x[-1]], y=[val, val],
+                name=f"EMA {key[3:]} (daily) ${val:,.2f}",
+                mode="lines", line=dict(width=width, color=color)),
+                row=1, col=1)
     fig.add_trace(go.Scatter(x=x, y=df["VWAP"], name="VWAP",
                              line=dict(width=1.2, color="#7c3aed", dash="dash")),
                   row=1, col=1)
@@ -1594,6 +1687,17 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
             if base_lo - span <= v <= base_hi + span:
                 ylo = min(ylo, v - pad * 0.5)
                 yhi = max(yhi, v + pad * 0.5)
+        # The daily EMA lines are drawn as traces, so the axis must be
+        # fit to include them — otherwise they sit off-view (the axis is
+        # fit to the visible bars, not autoranged). render() already hid
+        # any line more than DAILY_EMA_MAX_DIST away, so including the
+        # rest here bounds the stretch at that guard.
+        if show.get("daily_ema") and daily_ema:
+            for key in ("ema50", "ema200"):
+                v = daily_ema.get(key)
+                if v is not None:
+                    ylo = min(ylo, v - pad * 0.5)
+                    yhi = max(yhi, v + pad * 0.5)
         fig.update_yaxes(range=[ylo, yhi], row=1, col=1)
 
     # Session volume profile: horizontal histogram on the price panel,
@@ -1708,6 +1812,8 @@ with st.sidebar:
         "patterns": st.checkbox("Candlestick formations", value=True),
         "phases": st.checkbox("Time-cycle phases", value=True),
         "ema_long": st.checkbox("EMA 50 / 200 (trend context)", value=True),
+        "daily_ema": st.checkbox("Daily EMA 50 / 200 reference lines",
+                                 value=True),
         "volume_profile": st.checkbox(
             "Volume profile (POC / value area)", value=True),
     }
@@ -1797,12 +1903,45 @@ def render():
               f"{wconf['score']} / 100" if wconf else "—",
               wconf["direction"] if wconf else None, delta_color="off")
 
+    # Daily EMA 50/200 reference lines — daily closes through the last
+    # completed session (no lookahead). Fetched only when the toggle is
+    # on, on a slow daily bucket (the values change once a day); a failed
+    # or too-short pull just skips the lines, never the chart. A line
+    # more than DAILY_EMA_MAX_DIST from the last price is hidden (it
+    # would stretch the price panel) and named in the caption instead.
+    daily_levels = None
+    daily_ema = None
+    daily_ema_skipped: list[tuple[str, float]] = []
+    if show.get("daily_ema"):
+        try:
+            closes = fetch_daily_closes(
+                symbol,
+                _bucket(live, int(refresh_secs), bucket_secs=86400),
+                end=view_date.isoformat() if past_mode else "")
+            daily_levels = daily_ema_levels(closes, sel_date)
+        except Exception:
+            daily_levels = None
+        if daily_levels:
+            daily_ema = dict(daily_levels)
+            last_px = float(last["Close"])
+            for key in ("ema50", "ema200"):
+                val = daily_ema.get(key)
+                if (val is not None
+                        and abs(val - last_px) / last_px
+                        > DAILY_EMA_MAX_DIST):
+                    daily_ema_skipped.append((key, val))
+                    daily_ema[key] = None
+            if (daily_ema.get("ema50") is None
+                    and daily_ema.get("ema200") is None):
+                daily_ema = None
+
     trailing = CHART_TF_TRAILING[chart_tf]
     window_start = (disp.index[-1] - pd.Timedelta(minutes=trailing)
                     if trailing is not None else None)
     st.plotly_chart(build_chart(disp, symbol, zones, lines, pats, level_vals,
                                 pa, orng, show, window_start=window_start,
-                                chart_patterns=chart_pats, vp=vp),
+                                chart_patterns=chart_pats, vp=vp,
+                                daily_ema=daily_ema),
                     use_container_width=True,
                     key=f"pa_{symbol}_{tf_label}_{chart_tf.replace(' ', '_')}")
 
@@ -1822,6 +1961,38 @@ def render():
         else:
             st.caption("Volume profile unavailable for this session — no "
                        "usable price range or volume.")
+
+    if show.get("daily_ema"):
+        if daily_ema:
+            parts = []
+            if daily_ema.get("ema50") is not None:
+                parts.append(f"Daily EMA 50 ${daily_ema['ema50']:,.2f}")
+            if daily_ema.get("ema200") is not None:
+                parts.append(f"Daily EMA 200 ${daily_ema['ema200']:,.2f}")
+            skipped = ""
+            if daily_ema_skipped:
+                skipped = " " + "; ".join(
+                    f"EMA {k[3:]} (daily) ${v:,.2f} is more than "
+                    f"{DAILY_EMA_MAX_DIST:.0%} from price — line hidden"
+                    for k, v in daily_ema_skipped) + "."
+            st.caption(
+                " · ".join(parts) + " — flat reference lines from daily "
+                f"closes through {daily_ema['asof']} "
+                f"({daily_ema['n']} sessions). The EMA 50 / 200 lines on "
+                f"the chart are the last 50 / 200 minutes on {tf_label} "
+                f"bars; these are the daily clock.{skipped} Display only "
+                f"— not scored in the weighted confluence.")
+        elif daily_levels is not None:
+            # Levels loaded, but every line was hidden by the distance guard.
+            st.caption(
+                "Daily EMA 50 / 200 reference lines hidden — "
+                + "; ".join(
+                    f"EMA {k[3:]} (daily) ${v:,.2f}"
+                    for k, v in daily_ema_skipped)
+                + f" are more than {DAILY_EMA_MAX_DIST:.0%} from price.")
+        else:
+            st.caption("Daily EMA 50 / 200 reference lines unavailable — "
+                       "daily bars could not be loaded for this session.")
 
     if show.get("chart_patterns"):
         st.markdown("**Pattern recognition** (the book's chart patterns — "
