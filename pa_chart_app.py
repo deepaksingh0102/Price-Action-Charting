@@ -1709,46 +1709,38 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
     fig.update_layout(
         height=760, margin=dict(l=10, r=20, t=55, b=10),
         xaxis_rangeslider_visible=False, hovermode="x unified",
+        dragmode="zoom",
+        uirevision=f"{symbol}-{df.index[0].date()}-{zoom_mode}",
         legend=dict(orientation="h", yanchor="bottom", y=1.04, x=0,
                     font=dict(size=11)))
     if window_start is not None:
         fig.update_xaxes(range=[window_start, df.index[-1]])
 
-    # Fit the price axis to the visible bars. The always-drawn level lines
-    # (PDH/PDC/PDL, far zones) otherwise stretch the axis on gap days and
-    # squash the candles into a sliver. A level extends the range only when
-    # it sits within one visible-range of the action (tested against the
-    # base range, so inclusions can't cascade); farther levels stay drawn
-    # but off-view until price approaches them.
+    # Explicit price-axis ranges prevent distant historical levels and pattern
+    # annotations from compressing today's candles. Plotly's Reset axes uses
+    # this range. Pan/zoom remains enabled and uirevision preserves user zoom
+    # across live refreshes. Switching the zoom preset resets the viewport.
     vis = df[df.index >= window_start] if window_start is not None else df
     if len(vis):
-        pad = 0.004 * price
-        base_lo = float(vis["Low"].min())
-        base_hi = float(vis["High"].max())
-        ylo, yhi = base_lo - pad, base_hi + pad
-        span = base_hi - base_lo
-        cands = [z["center"] for z in drawn_zones]
-        if vp is not None and show.get("value_area", True):
-            cands += [vp["vah"], vp["poc"], vp["val"]]
-        if pa:
-            cands += [pa["PDH"], pa["PDC"], pa["PDL"]]
-        if orng:
-            cands += [orng["high"], orng["low"]]
-        # Daily EMA lines are levels too — they join `cands` and follow
-        # the same one-span rule. (The first version extended the axis
-        # to any drawn daily line, which on a narrow-range day stretched
-        # the panel to 10x the session range and squashed the candles
-        # into a sliver — the Nov 12 AAPL screenshot. Never again.)
-        if False and daily_ema:
-            for key in ("ema50", "ema200"):
-                v = daily_ema.get(key)
-                if v is not None:
-                    cands.append(v)
-        for v in cands:
-            if base_lo - span <= v <= base_hi + span:
-                ylo = min(ylo, v - pad * 0.5)
-                yhi = max(yhi, v + pad * 0.5)
-        fig.update_yaxes(range=[ylo, yhi], row=1, col=1)
+        low = float(vis["Low"].min())
+        high = float(vis["High"].max())
+        last_px = float(vis["Close"].iloc[-1])
+        if zoom_mode == "Recent 30 minutes":
+            recent = vis[vis.index >= vis.index[-1] - pd.Timedelta(minutes=30)]
+            if len(recent):
+                low, high = float(recent["Low"].min()), float(recent["High"].max())
+        elif zoom_mode == "Recent 60 minutes":
+            recent = vis[vis.index >= vis.index[-1] - pd.Timedelta(minutes=60)]
+            if len(recent):
+                low, high = float(recent["Low"].min()), float(recent["High"].max())
+        elif zoom_mode == "Near current price":
+            width = max(last_px * 0.008, 1.5)
+            low, high = last_px - width, last_px + width
+        spread = max(high - low, last_px * 0.002)
+        padding = max(spread * 0.08, last_px * 0.001)
+        fig.update_yaxes(range=[low - padding, high + padding],
+                         autorange=False, fixedrange=False, row=1, col=1)
+    fig.update_xaxes(fixedrange=False, row=1, col=1)
 
     # Volume profile histogram intentionally hidden. Keep the three
     # calculated price references, independent of histogram visibility.
@@ -1819,6 +1811,12 @@ with st.sidebar:
         # fetch bucket, so the loaders pull fresh bars.
         st.session_state["refresh_nonce"] = \
             st.session_state.get("refresh_nonce", 0) + 1
+    zoom_mode = st.selectbox(
+        "Price chart zoom",
+        ["Price action", "Recent 60 minutes", "Recent 30 minutes",
+         "Near current price"], index=0,
+        help="Controls initial/reset vertical scale. Drag on the chart to zoom; "
+             "double-click to reset. A changed preset resets the view.")
     st.header("Show")
     show = {
         "zones": st.checkbox("Support / resistance zones", value=True),
@@ -1963,9 +1961,11 @@ def render():
     st.plotly_chart(build_chart(disp, symbol, zones, lines, pats, level_vals,
                                 pa, orng, show, window_start=window_start,
                                 chart_patterns=chart_pats, vp=vp,
-                                daily_ema=daily_ema),
+                                daily_ema=daily_ema, zoom_mode=zoom_mode),
                     use_container_width=True,
-                    key=f"pa_{symbol}_{tf_label}_{chart_tf.replace(' ', '_')}")
+                    config={"scrollZoom": True, "displayModeBar": True,
+                            "doubleClick": "reset", "responsive": True},
+                    key=f"pa_{symbol}_{tf_label}_{chart_tf.replace(' ', '_')}_{zoom_mode}")
 
     if show.get('sr_levels'):
         if sr_levels:
