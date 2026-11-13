@@ -63,7 +63,7 @@ ALPACA_BASE = "https://data.alpaca.markets/v2"
 # Version stamp: the footer shows this tag plus a hash computed live from
 # the deployed file itself, so the page proves which build is running —
 # compare it with the hash named when the file was delivered.
-BUILD_TAG = "2026-11-13-SR"
+BUILD_TAG = "2026-11-13-ZOOM-FIX"
 
 
 def _build_hash() -> str:
@@ -1499,7 +1499,8 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
                 chart_patterns: list[dict] | None = None,
                 vp: dict | None = None,
                 daily_ema: dict | None = None,
-                 sr_levels: list[dict] | None = None) -> go.Figure:
+                 sr_levels: list[dict] | None = None,
+                zoom_mode: str = "Price action") -> go.Figure:
     """Clean 2-panel chart: price with S/R and value-area references, volume."""
     price = float(df["Close"].iloc[-1])
     fig = make_subplots(
@@ -1961,7 +1962,8 @@ def render():
     st.plotly_chart(build_chart(disp, symbol, zones, lines, pats, level_vals,
                                 pa, orng, show, window_start=window_start,
                                 chart_patterns=chart_pats, vp=vp,
-                                daily_ema=daily_ema, zoom_mode=zoom_mode),
+                                daily_ema=daily_ema, sr_levels=sr_levels,
+                                zoom_mode=zoom_mode),
                     use_container_width=True,
                     config={"scrollZoom": True, "displayModeBar": True,
                             "doubleClick": "reset", "responsive": True},
