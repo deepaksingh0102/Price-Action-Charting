@@ -1430,60 +1430,104 @@ def build_pcr_gauge(pcr: float) -> go.Figure:
 def nearby_sr_levels(df: pd.DataFrame, zones: list[dict],
                      vp: dict | None = None, pa: dict | None = None,
                      orng: dict | None = None) -> list[dict]:
-    """Nearest actionable reference levels, using only available session bars.
+    """Show a few meaningful levels without calling every swing high support.
 
-    A swing needs subsequent bars for confirmation. VAL/VAH are volume-profile
-    references, not guaranteed turning points. Do not label a level as confirmed
-    support simply because it is below the current price.
+    A swing high is potential flipped support only after a close above it.
+    A later retest that holds is needed for confirmed flipped support.
+    Confirmed swing lows require at least two spaced tests. All tests use
+    candles available at the time of this snapshot; no future candles.
     """
     if df.empty:
         return []
     price = float(df['Close'].iloc[-1])
+    close = df['Close'].to_numpy(dtype=float)
+    high = df['High'].to_numpy(dtype=float)
+    low = df['Low'].to_numpy(dtype=float)
+    n = len(df)
+    tol = max(0.08, price * 0.00025)
+    cluster_tol = max(0.15, price * 0.00075)
     candidates = []
 
-    def add(value, source, priority=1):
+    def add(value, source, status='Reference', priority=1):
         if value is None or not np.isfinite(value) or value <= 0:
             return
         candidates.append({'price': float(value), 'source': source,
-                           'priority': priority})
+                           'status': status, 'priority': priority})
 
-    # The swing detector requires five bars on each side of an extremum.
     highs, lows = swing_points(df, w=5)
-    for i in lows[-12:]:
-        add(df['Low'].iloc[i], 'Swing low', 3)
-    for i in highs[-12:]:
-        add(df['High'].iloc[i], 'Swing high', 3)
-    for z in zones:
-        add(z['center'], f"Zone x{z['touches']}", 4)
-    if vp:
-        add(vp['val'], 'VAL', 2)
-        add(vp['vah'], 'VAH', 2)
-        add(vp['poc'], 'POC', 1)
-    if pa:
-        add(pa.get('PDL'), 'PDL', 2)
-        add(pa.get('PDH'), 'PDH', 2)
-    if orng:
-        add(orng.get('low'), 'OR low', 2)
-        add(orng.get('high'), 'OR high', 2)
+    for i in highs[-18:]:
+        level = float(high[i])
+        # Crossing must happen after the pivot has become confirmable.
+        crossings = [j for j in range(i + 6, n)
+                     if close[j] > level + tol and close[j - 1] <= level + tol]
+        if crossings:
+            first = crossings[0]
+            retests = [j for j in range(first + 1, n)
+                       if low[j] <= level + tol and close[j] >= level - tol]
+            # Retest must be followed by at least one candle holding above.
+            held = any(j + 1 < n and close[j + 1] >= level - tol
+                       for j in retests)
+            if price >= level - tol:
+                add(level, 'Former swing high',
+                    'Confirmed flipped support' if held else 'Potential flipped support',
+                    6 if held else 3)
+            else:
+                add(level, 'Former swing high', 'Broken support / resistance', 2)
+        elif level > price:
+            add(level, 'Swing high', 'Resistance reference', 2)
 
-    # Merge overlapping references to avoid stacked labels/duplicate lines.
-    # Keep the highest-priority reference as the representative.
-    candidates.sort(key=lambda a: (-a['priority'], abs(a['price'] - price)))
-    selected = []
-    tol = max(0.04, price * 0.00015)
+    for i in lows[-18:]:
+        level = float(low[i])
+        tests = [j for j in lows if abs(float(low[j]) - level) <= tol]
+        spaced = any(abs(j - k) >= 5 for j in tests for k in tests)
+        if price >= level - tol:
+            add(level, 'Swing low', 'Confirmed support' if spaced else 'Potential support',
+                5 if spaced else 2)
+        else:
+            add(level, 'Swing low', 'Broken support', 1)
+
+    for z in zones:
+        level = float(z['center'])
+        status = ('Confirmed support' if level < price else 'Resistance reference')
+        add(level, f"Zone x{z['touches']}", status, 5)
+    if vp:
+        add(vp['val'], 'VAL', 'Value area reference', 2)
+        add(vp['vah'], 'VAH', 'Value area reference', 2)
+        add(vp['poc'], 'POC', 'Volume reference', 1)
+    if pa:
+        add(pa.get('PDL'), 'PDL', 'Prior-day reference', 2)
+        add(pa.get('PDH'), 'PDH', 'Prior-day reference', 2)
+    if orng:
+        add(orng.get('low'), 'OR low', 'Opening-range reference', 2)
+        add(orng.get('high'), 'OR high', 'Opening-range reference', 2)
+
+    # Cluster neighboring levels into a single band; prioritize tested levels.
+    candidates.sort(key=lambda c: c['price'])
+    groups = []
     for c in candidates:
-        if any(abs(c['price'] - a['price']) <= tol for a in selected):
-            continue
-        selected.append(c)
-    below = sorted((c for c in selected if c['price'] < price),
-                   key=lambda a: -a['price'])[:2]
-    above = sorted((c for c in selected if c['price'] > price),
-                   key=lambda a: a['price'])[:2]
-    for c in below:
-        c['kind'] = 'Support reference'
-    for c in above:
-        c['kind'] = 'Resistance reference'
-    return below + above
+        if groups and c['price'] - groups[-1][-1]['price'] <= cluster_tol:
+            groups[-1].append(c)
+        else:
+            groups.append([c])
+    merged = []
+    for group in groups:
+        best = max(group, key=lambda c: (c['priority'],
+                                         -abs(c['price'] - price)))
+        lo = min(c['price'] for c in group)
+        hi = max(c['price'] for c in group)
+        entry = dict(best)
+        entry['low'], entry['high'] = lo, hi
+        entry['price'] = best['price']
+        entry['sources'] = len(group)
+        entry['kind'] = 'Support' if hi < price else ('Resistance' if lo > price else 'At price')
+        # An untested former high must never be promoted to confirmed support.
+        merged.append(entry)
+    below = sorted((c for c in merged if c['kind'] == 'Support'),
+                   key=lambda c: -c['high'])[:2]
+    above = sorted((c for c in merged if c['kind'] == 'Resistance'),
+                   key=lambda c: c['low'])[:2]
+    at_price = [c for c in merged if c['kind'] == 'At price']
+    return below + at_price[:1] + above
 
 
 # ---------------------------------------------------------------- chart
@@ -1595,22 +1639,26 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
                       annotation_text=f"OR low {orng['low']:,.2f}",
                       annotation_position="bottom left")
 
-    # Clearly labeled horizontal S/R references. Draw after shaded zones so
-    # the reference lines remain visible. These are not entry signals.
+    # One line or band per clustered level, with status-specific labeling.
     if show.get('sr_levels') and sr_levels:
-        for rank, level in enumerate(sr_levels):
-            is_support = level['kind'].startswith('Support')
-            color = '#15803d' if is_support else '#ea580c'
-            dash = 'solid' if rank in (0, len([v for v in sr_levels
-                                               if v['kind'].startswith('Support')])) else 'dash'
-            label = ('SUPPORT' if is_support else 'RESISTANCE')
-            fig.add_hline(
-                y=level['price'], row=1, col=1,
-                line_color=color, line_width=2.6 if dash == 'solid' else 1.8,
-                line_dash=dash,
-                annotation_text=f"{label} {level['price']:,.2f} ({level['source']})",
-                annotation_position='bottom right' if is_support else 'top right',
-                annotation_font=dict(size=11, color=color))
+        for level in sr_levels:
+            is_support = level['kind'] == 'Support'
+            is_resistance = level['kind'] == 'Resistance'
+            color = '#15803d' if is_support else '#ea580c' if is_resistance else '#64748b'
+            lo, hi = level['low'], level['high']
+            status = level['status']
+            label = f"{status} {lo:,.2f}–{hi:,.2f}" if hi - lo >= 0.03 else f"{status} {level['price']:,.2f}"
+            if hi - lo >= 0.03:
+                fig.add_hrect(y0=lo, y1=hi, row=1, col=1,
+                              fillcolor='rgba(21,128,61,0.06)' if is_support else 'rgba(234,88,12,0.06)',
+                              line_width=0)
+            fig.add_hline(y=level['price'], row=1, col=1,
+                          line_color=color,
+                          line_width=2.5 if status.startswith('Confirmed') else 1.5,
+                          line_dash='solid' if status.startswith('Confirmed') else 'dash',
+                          annotation_text=label,
+                          annotation_position='bottom right' if is_support else 'top right',
+                          annotation_font=dict(size=10, color=color))
 
     # Trendlines
     if show.get("lines"):
@@ -1972,7 +2020,7 @@ def render():
     if show.get('sr_levels'):
         if sr_levels:
             st.caption('Nearest S/R references (not guaranteed turning points): '
-                       + ' | '.join(f"{v['kind']} ${v['price']:,.2f} ({v['source']})"
+                       + ' | '.join(f"{v['status']} ${v['low']:,.2f}–${v['high']:,.2f} ({v['source']})"
                                     for v in sr_levels))
         else:
             st.caption('No confirmed nearby swing or reference levels yet.')
