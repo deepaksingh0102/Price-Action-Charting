@@ -1688,7 +1688,7 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
                 # Label at most one formation per 4 bars — in a choppy open
                 # the labels otherwise stack into an unreadable blob. The
                 # markers themselves are always drawn.
-                if labels and i - last_labeled >= 4:
+                if labels and i - last_labeled >= 8:
                     txts.append(name)
                     last_labeled = i
                 else:
@@ -1824,12 +1824,12 @@ with st.sidebar:
         "zones": st.checkbox("Support / resistance zones", value=True),
         "sr_levels": st.checkbox("Show Support/Resistance Lines", value=True,
                                   help="Nearest swing, zone and volume-profile reference levels with price labels."),
-        "lines": st.checkbox("Trendlines", value=False),
+        "lines": st.checkbox("Book trendlines", value=True, key="restored_trendlines"),
         "chart_patterns": st.checkbox(
             "Pattern recognition (ranges, triangles, wedges, flags, "
-            "pennants, staircases)", value=False),
-        "patterns": st.checkbox("Candlestick formations", value=False),
-        "phases": st.checkbox("Time-cycle phases", value=False),
+            "pennants, staircases)", value=True, key="restored_patterns"),
+        "patterns": st.checkbox("Book candlestick formations", value=True, key="restored_candles"),
+        "phases": st.checkbox("Time-cycle phases", value=True, key="restored_phases"),
         "ema_long": st.checkbox("EMA 50 / 200 (trend context)", value=False),
         "daily_ema": False,
         "volume_profile": False,
