@@ -1500,16 +1500,12 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
                 vp: dict | None = None,
                 daily_ema: dict | None = None,
                  sr_levels: list[dict] | None = None) -> go.Figure:
-    """3 panels: price (candles, EMA 9/21/50/200, VWAP, daily EMA 50/200
-    reference lines, zones, trendlines, PDH/PDC/PDL, opening range,
-    pattern markers, time-cycle phases, session volume profile), volume,
-    stochastic."""
+    """Clean 2-panel chart: price with S/R and value-area references, volume."""
     price = float(df["Close"].iloc[-1])
     fig = make_subplots(
-        rows=3, cols=1, shared_xaxes=True,
-        row_heights=[0.66, 0.10, 0.24], vertical_spacing=0.05,
-        subplot_titles=(f"{symbol} — price action", "Volume",
-                        "Stochastic (momentum shift)"))
+        rows=2, cols=1, shared_xaxes=True,
+        row_heights=[0.84, 0.16], vertical_spacing=0.06,
+        subplot_titles=(f"{symbol} — price action", "Volume"))
     x = df.index
     fig.add_trace(go.Candlestick(
         x=x, open=df["Open"], high=df["High"], low=df["Low"],
@@ -1517,9 +1513,9 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
         increasing_line_color="#16a34a", decreasing_line_color="#dc2626"),
         row=1, col=1)
     fig.add_trace(go.Scatter(x=x, y=df["EMA9"], name="EMA 9",
-                             line=dict(width=1.4, color="#f59e0b")), row=1, col=1)
+                             line=dict(width=2.0, color="#2563eb")), row=1, col=1)
     fig.add_trace(go.Scatter(x=x, y=df["EMA21"], name="EMA 21",
-                             line=dict(width=1.4, color="#2563eb")), row=1, col=1)
+                             line=dict(width=2.0, color="#0d9488")), row=1, col=1)
     if show.get("ema_long"):
         fig.add_trace(go.Scatter(x=x, y=df["EMA50"], name="EMA 50",
                                  line=dict(width=1.2, color="#db2777")),
@@ -1527,24 +1523,8 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
         fig.add_trace(go.Scatter(x=x, y=df["EMA200"], name="EMA 200",
                                  line=dict(width=1.8, color="#1f2937")),
                       row=1, col=1)
-    # Daily EMA 50/200 reference lines: flat lines from daily closes
-    # (completed sessions only) — the daily clock, not the bar-size
-    # clock. Same colours as the intraday EMA 50/200 so the colour
-    # language matches; flat + "(daily)" tells them apart. Two-point
-    # traces, so they appear in the legend with their values.
-    if show.get("daily_ema") and daily_ema:
-        for key, color, width in (("ema50", "#db2777", 2.2),
-                                  ("ema200", "#1f2937", 2.2)):
-            val = daily_ema.get(key)
-            if val is None:
-                continue
-            fig.add_trace(go.Scatter(
-                x=[x[0], x[-1]], y=[val, val],
-                name=f"EMA {key[3:]} (daily) ${val:,.2f}",
-                mode="lines", line=dict(width=width, color=color)),
-                row=1, col=1)
     fig.add_trace(go.Scatter(x=x, y=df["VWAP"], name="VWAP",
-                             line=dict(width=1.2, color="#7c3aed", dash="dash")),
+                             line=dict(width=2.0, color="#7c3aed", dash="dash")),
                   row=1, col=1)
 
     # Time-cycle phases: shaded session bands on the price panel
@@ -1726,21 +1706,11 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
     fig.add_trace(go.Bar(x=x, y=df["Volume"], marker_color=colors,
                          name="Volume", showlegend=False), row=2, col=1)
 
-    # Stochastic
-    fig.add_trace(go.Scatter(x=x, y=df["StochK"], name="%K",
-                             line=dict(width=1.5, color="#2563eb")), row=3, col=1)
-    fig.add_trace(go.Scatter(x=x, y=df["StochD"], name="%D",
-                             line=dict(width=1.2, color="#f97316")), row=3, col=1)
-    fig.add_hline(y=80, line_dash="dot", line_color="#9ca3af", row=3, col=1,
-                  annotation_text="Overbought 80", annotation_position="top left")
-    fig.add_hline(y=20, line_dash="dot", line_color="#9ca3af", row=3, col=1,
-                  annotation_text="Oversold 20", annotation_position="bottom left")
-
     fig.update_layout(
-        height=950, margin=dict(l=10, r=10, t=40, b=10),
+        height=760, margin=dict(l=10, r=20, t=55, b=10),
         xaxis_rangeslider_visible=False, hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.04, x=0))
-    fig.update_yaxes(range=[0, 100], row=3, col=1)
+        legend=dict(orientation="h", yanchor="bottom", y=1.04, x=0,
+                    font=dict(size=11)))
     if window_start is not None:
         fig.update_xaxes(range=[window_start, df.index[-1]])
 
@@ -1758,6 +1728,8 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
         ylo, yhi = base_lo - pad, base_hi + pad
         span = base_hi - base_lo
         cands = [z["center"] for z in drawn_zones]
+        if vp is not None and show.get("value_area", True):
+            cands += [vp["vah"], vp["poc"], vp["val"]]
         if pa:
             cands += [pa["PDH"], pa["PDC"], pa["PDL"]]
         if orng:
@@ -1767,7 +1739,7 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
         # to any drawn daily line, which on a narrow-range day stretched
         # the panel to 10x the session range and squashed the candles
         # into a sliver — the Nov 12 AAPL screenshot. Never again.)
-        if show.get("daily_ema") and daily_ema:
+        if False and daily_ema:
             for key in ("ema50", "ema200"):
                 v = daily_ema.get(key)
                 if v is not None:
@@ -1778,54 +1750,21 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
                 yhi = max(yhi, v + pad * 0.5)
         fig.update_yaxes(range=[ylo, yhi], row=1, col=1)
 
-    # Session volume profile: horizontal histogram on the price panel,
-    # drawn on a secondary x-axis (x4) that overlays the right-hand
-    # fifth of the panel, so it never collides with the candles. The
-    # POC bin is amber; POC is the amber line, VAH/VAL bracket the 70%
-    # value area. x4 is used on purpose, NOT x2: in this 3-row figure
-    # with shared x-axes, x2 is already the Volume panel's axis and x3
-    # the Stochastic panel's — redefining x2 (as the first version did)
-    # hijacked the shared-x range with a volume scale and pushed the
-    # candles, EMAs, VWAP and volume bars off-screen. x4 is a fresh
-    # overlay axis with no other role.
-    # This block runs AFTER the window-range update above on purpose:
-    # update_xaxes(range=...) applies to every x-axis present, and x4's
-    # range is a volume scale, not a time scale.
-    if show.get("volume_profile") and vp is not None:
-        vols = vp["volumes"]
-        m = float(vols.max())
-        if m > 0:
-            colors = ["rgba(245, 158, 11, 0.55)"
-                      if i == vp["poc_i"] else "rgba(37, 99, 235, 0.30)"
-                      for i in range(len(vols))]
-            fig.add_trace(go.Bar(
-                y=vp["centers"], x=vols, orientation="h",
-                width=vp["bin_width"] * 0.9, marker_color=colors,
-                name="Volume profile", showlegend=True,
-                hovertemplate="Price %{y:,.2f}<br>Volume %{x:,.0f}"
-                              "<extra></extra>"),
-                row=1, col=1)
-            fig.data[-1].update(xaxis="x4")
-            fig.update_layout(
-                xaxis4=dict(overlaying="x", side="top",
-                            range=[-4 * m, m], showgrid=False,
-                            showticklabels=False, zeroline=False,
-                            fixedrange=True))
-            fig.add_hline(y=vp["poc"], line_dash="solid",
-                          line_color="#f59e0b", line_width=1.6,
-                          row=1, col=1,
-                          annotation_text=f"POC {vp['poc']:,.2f}",
-                          annotation_position="top right")
-            fig.add_hline(y=vp["vah"], line_dash="dot",
-                          line_color="#9ca3af", line_width=1.2,
-                          row=1, col=1,
-                          annotation_text=f"VAH {vp['vah']:,.2f}",
-                          annotation_position="top left")
-            fig.add_hline(y=vp["val"], line_dash="dot",
-                          line_color="#9ca3af", line_width=1.2,
-                          row=1, col=1,
-                          annotation_text=f"VAL {vp['val']:,.2f}",
-                          annotation_position="bottom left")
+    # Volume profile histogram intentionally hidden. Keep the three
+    # calculated price references, independent of histogram visibility.
+    if vp is not None and show.get("value_area", True):
+        # Distinct, consistently colored lines with readable labels.
+        for key, label, color, dash, width, position in (
+            ("vah", "VAH", "#9333ea", "dash", 2.1, "top left"),
+            ("poc", "POC", "#d97706", "solid", 2.2, "top right"),
+            ("val", "VAL", "#0891b2", "dash", 2.1, "bottom left"),
+        ):
+            fig.add_hline(
+                y=vp[key], line_dash=dash, line_color=color,
+                line_width=width, row=1, col=1,
+                annotation_text=f"{label} {vp[key]:,.2f}",
+                annotation_position=position,
+                annotation_font=dict(color=color, size=12))
     return fig
 
 
@@ -1885,19 +1824,20 @@ with st.sidebar:
         "zones": st.checkbox("Support / resistance zones", value=True),
         "sr_levels": st.checkbox("Show Support/Resistance Lines", value=True,
                                   help="Nearest swing, zone and volume-profile reference levels with price labels."),
-        "lines": st.checkbox("Trendlines", value=True),
+        "lines": st.checkbox("Trendlines", value=False),
         "chart_patterns": st.checkbox(
             "Pattern recognition (ranges, triangles, wedges, flags, "
-            "pennants, staircases)", value=True),
-        "patterns": st.checkbox("Candlestick formations", value=True),
-        "phases": st.checkbox("Time-cycle phases", value=True),
-        "ema_long": st.checkbox("EMA 50 / 200 (trend context)", value=True),
-        "daily_ema": st.checkbox("Daily EMA 50 / 200 reference lines",
-                                 value=True),
-        "volume_profile": st.checkbox(
-            "Volume profile (POC / value area)", value=True),
+            "pennants, staircases)", value=False),
+        "patterns": st.checkbox("Candlestick formations", value=False),
+        "phases": st.checkbox("Time-cycle phases", value=False),
+        "ema_long": st.checkbox("EMA 50 / 200 (trend context)", value=False),
+        "daily_ema": False,
+        "volume_profile": False,
+        "value_area": st.checkbox("VAH / POC / VAL price lines", value=True,
+                                  help="Keep value-area reference lines without the volume-profile histogram."),
     }
-    st.caption("Formations are labeled only when they form AT a level "
+    st.caption("Colors: support green · resistance red-orange · VAH purple · POC amber · VAL cyan · EMA9 blue · EMA21 teal · VWAP dashed purple. "
+               "Formations are labeled only when they form AT a level "
                "(zone, PDH/PDC/PDL, opening-range edge) — the book's rule. "
                "Mid-chart formations appear as faint markers.")
 
@@ -1974,9 +1914,7 @@ def render():
     c2.metric("Zones on chart",
               f"{sum(1 for z in zones if z['center'] >= float(last['Close']))} selling / "
               f"{sum(1 for z in zones if z['center'] < float(last['Close']))} buying")
-    c3.metric("Stochastic %K / %D",
-              f"{float(last['StochK']):.0f} / {float(last['StochD']):.0f}"
-              if pd.notna(last["StochK"]) else "—")
+    c3.metric("Session VWAP", f"${float(last['VWAP']):,.2f}")
     wconf = weighted_confluence(
         disp, zones, level_vals, pa, orng, chart_pats,
         pcr_zone(p["pcr"])[0] if p is not None else None)
@@ -1996,7 +1934,7 @@ def render():
     daily_levels = None
     daily_ema = None
     daily_ema_skipped: list[tuple[str, float]] = []
-    if show.get("daily_ema"):
+    if False:  # Daily EMA reference lines removed from clean chart
         try:
             closes = fetch_daily_closes(
                 symbol,
@@ -2037,24 +1975,12 @@ def render():
         else:
             st.caption('No confirmed nearby swing or reference levels yet.')
 
-    if show.get("volume_profile"):
-        if vp is not None:
-            st.caption(
-                f"Volume profile — session {sel_date}, {tf_label} bars, "
-                f"{vp['n_bins']} price bins: POC "
-                f"${vp['poc']:,.2f} (most volume traded here) · value area "
-                f"${vp['val']:,.2f} – ${vp['vah']:,.2f} "
-                f"({vp['va_volume'] / vp['total_volume']:.0%} of "
-                f"{vp['total_volume']:,.0f} shares). Price holding above "
-                f"the POC with the value area below it is acceptance "
-                f"higher; a close back below the POC after holding above "
-                f"it is the profile's rejection read. Display only — not "
-                f"scored in the weighted confluence.")
-        else:
-            st.caption("Volume profile unavailable for this session — no "
-                       "usable price range or volume.")
+    if show.get("value_area") and vp is not None:
+        st.caption(f"Session value area: VAH ${vp['vah']:,.2f} · "
+                   f"POC ${vp['poc']:,.2f} · VAL ${vp['val']:,.2f}. "
+                   "Levels update with session volume; they are references, not guaranteed support/resistance.")
 
-    if show.get("daily_ema"):
+    if False:  # Daily EMA reference lines removed from clean chart
         if daily_ema:
             last_px = float(last["Close"])
             parts = []
@@ -2231,9 +2157,7 @@ with st.expander("How to read this chart"):
         "sessions. Price holding above both is the wind at a long's "
         "back; below both, at a short's. Toggle them off in the sidebar "
         "(Show → EMA 50 / 200) if the chart feels crowded.\n"
-        "- **Stochastic (bottom)** — momentum shifts: blue %K crossing orange "
-        "%D is the event; crossing up from under 20 or down from over 80 is "
-        "the one that matters, especially right at a level.\n"
+        "- **Stochastic** — not displayed on the clean chart; internal confluence calculation remains unchanged.\n"
         "- **Put/Call Ratio strip** — options sentiment for the symbol "
         "(by traded volume; the open-interest PCR is shown alongside). "
         "Under 0.7 = oversold, reversal watch · 0.7–0.9 = bearish zone · "
