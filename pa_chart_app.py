@@ -63,7 +63,7 @@ ALPACA_BASE = "https://data.alpaca.markets/v2"
 # Version stamp: the footer shows this tag plus a hash computed live from
 # the deployed file itself, so the page proves which build is running —
 # compare it with the hash named when the file was delivered.
-BUILD_TAG = "2026-11-12"
+BUILD_TAG = "2026-11-13-SR"
 
 
 def _build_hash() -> str:
@@ -1425,6 +1425,67 @@ def build_pcr_gauge(pcr: float) -> go.Figure:
         yaxis=dict(visible=False, fixedrange=True),
         dragmode=False)
     return fig
+# ---------------------------------------------------------------- prominent support / resistance
+
+def nearby_sr_levels(df: pd.DataFrame, zones: list[dict],
+                     vp: dict | None = None, pa: dict | None = None,
+                     orng: dict | None = None) -> list[dict]:
+    """Nearest actionable reference levels, using only available session bars.
+
+    A swing needs subsequent bars for confirmation. VAL/VAH are volume-profile
+    references, not guaranteed turning points. Do not label a level as confirmed
+    support simply because it is below the current price.
+    """
+    if df.empty:
+        return []
+    price = float(df['Close'].iloc[-1])
+    candidates = []
+
+    def add(value, source, priority=1):
+        if value is None or not np.isfinite(value) or value <= 0:
+            return
+        candidates.append({'price': float(value), 'source': source,
+                           'priority': priority})
+
+    # The swing detector requires five bars on each side of an extremum.
+    highs, lows = swing_points(df, w=5)
+    for i in lows[-12:]:
+        add(df['Low'].iloc[i], 'Swing low', 3)
+    for i in highs[-12:]:
+        add(df['High'].iloc[i], 'Swing high', 3)
+    for z in zones:
+        add(z['center'], f"Zone x{z['touches']}", 4)
+    if vp:
+        add(vp['val'], 'VAL', 2)
+        add(vp['vah'], 'VAH', 2)
+        add(vp['poc'], 'POC', 1)
+    if pa:
+        add(pa.get('PDL'), 'PDL', 2)
+        add(pa.get('PDH'), 'PDH', 2)
+    if orng:
+        add(orng.get('low'), 'OR low', 2)
+        add(orng.get('high'), 'OR high', 2)
+
+    # Merge overlapping references to avoid stacked labels/duplicate lines.
+    # Keep the highest-priority reference as the representative.
+    candidates.sort(key=lambda a: (-a['priority'], abs(a['price'] - price)))
+    selected = []
+    tol = max(0.04, price * 0.00015)
+    for c in candidates:
+        if any(abs(c['price'] - a['price']) <= tol for a in selected):
+            continue
+        selected.append(c)
+    below = sorted((c for c in selected if c['price'] < price),
+                   key=lambda a: -a['price'])[:2]
+    above = sorted((c for c in selected if c['price'] > price),
+                   key=lambda a: a['price'])[:2]
+    for c in below:
+        c['kind'] = 'Support reference'
+    for c in above:
+        c['kind'] = 'Resistance reference'
+    return below + above
+
+
 # ---------------------------------------------------------------- chart
 PHASES = [(570, 630, "Opening drive", "rgba(37, 99, 235, 0.05)"),
           (750, 780, "Midday", "rgba(107, 114, 128, 0.05)"),
@@ -1437,7 +1498,8 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
                 show: dict, window_start=None,
                 chart_patterns: list[dict] | None = None,
                 vp: dict | None = None,
-                daily_ema: dict | None = None) -> go.Figure:
+                daily_ema: dict | None = None,
+                 sr_levels: list[dict] | None = None) -> go.Figure:
     """3 panels: price (candles, EMA 9/21/50/200, VWAP, daily EMA 50/200
     reference lines, zones, trendlines, PDH/PDC/PDL, opening range,
     pattern markers, time-cycle phases, session volume profile), volume,
@@ -1551,6 +1613,23 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
                       line_width=1.2, row=1, col=1,
                       annotation_text=f"OR low {orng['low']:,.2f}",
                       annotation_position="bottom left")
+
+    # Clearly labeled horizontal S/R references. Draw after shaded zones so
+    # the reference lines remain visible. These are not entry signals.
+    if show.get('sr_levels') and sr_levels:
+        for rank, level in enumerate(sr_levels):
+            is_support = level['kind'].startswith('Support')
+            color = '#15803d' if is_support else '#ea580c'
+            dash = 'solid' if rank in (0, len([v for v in sr_levels
+                                               if v['kind'].startswith('Support')])) else 'dash'
+            label = ('SUPPORT' if is_support else 'RESISTANCE')
+            fig.add_hline(
+                y=level['price'], row=1, col=1,
+                line_color=color, line_width=2.6 if dash == 'solid' else 1.8,
+                line_dash=dash,
+                annotation_text=f"{label} {level['price']:,.2f} ({level['source']})",
+                annotation_position='bottom right' if is_support else 'top right',
+                annotation_font=dict(size=11, color=color))
 
     # Trendlines
     if show.get("lines"):
@@ -1804,6 +1883,8 @@ with st.sidebar:
     st.header("Show")
     show = {
         "zones": st.checkbox("Support / resistance zones", value=True),
+        "sr_levels": st.checkbox("Show Support/Resistance Lines", value=True,
+                                  help="Nearest swing, zone and volume-profile reference levels with price labels."),
         "lines": st.checkbox("Trendlines", value=True),
         "chart_patterns": st.checkbox(
             "Pattern recognition (ranges, triangles, wedges, flags, "
@@ -1871,6 +1952,7 @@ def render():
     zones = sr_zones(disp)
     lines = trendlines(disp)
     vp = session_volume_profile(disp)
+    sr_levels = nearby_sr_levels(disp, zones, vp, pa, orng)
     chart_pats = detect_chart_patterns(disp)
     pats = candle_patterns(disp)
     level_vals = ([pa["PDH"], pa["PDC"], pa["PDL"]] if pa else []) \
@@ -1946,6 +2028,14 @@ def render():
                                 daily_ema=daily_ema),
                     use_container_width=True,
                     key=f"pa_{symbol}_{tf_label}_{chart_tf.replace(' ', '_')}")
+
+    if show.get('sr_levels'):
+        if sr_levels:
+            st.caption('Nearest S/R references (not guaranteed turning points): '
+                       + ' | '.join(f"{v['kind']} ${v['price']:,.2f} ({v['source']})"
+                                    for v in sr_levels))
+        else:
+            st.caption('No confirmed nearby swing or reference levels yet.')
 
     if show.get("volume_profile"):
         if vp is not None:
