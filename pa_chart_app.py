@@ -63,7 +63,7 @@ ALPACA_BASE = "https://data.alpaca.markets/v2"
 # Version stamp: the footer shows this tag plus a hash computed live from
 # the deployed file itself, so the page proves which build is running —
 # compare it with the hash named when the file was delivered.
-BUILD_TAG = "2026-11-13-ZOOM-FIX"
+BUILD_TAG = "2026-11-16-EMA-COLORS"
 
 
 def _build_hash() -> str:
@@ -1558,9 +1558,9 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
         increasing_line_color="#16a34a", decreasing_line_color="#dc2626"),
         row=1, col=1)
     fig.add_trace(go.Scatter(x=x, y=df["EMA9"], name="EMA 9",
-                             line=dict(width=2.0, color="#2563eb")), row=1, col=1)
+                             line=dict(width=2.0, color="#F59E0B")), row=1, col=1)
     fig.add_trace(go.Scatter(x=x, y=df["EMA21"], name="EMA 21",
-                             line=dict(width=2.0, color="#0d9488")), row=1, col=1)
+                             line=dict(width=2.0, color="#3B82F6")), row=1, col=1)
     if show.get("ema_long"):
         fig.add_trace(go.Scatter(x=x, y=df["EMA50"], name="EMA 50",
                                  line=dict(width=1.2, color="#db2777")),
@@ -1883,7 +1883,7 @@ with st.sidebar:
         "value_area": st.checkbox("VAH / POC / VAL price lines", value=True,
                                   help="Keep value-area reference lines without the volume-profile histogram."),
     }
-    st.caption("Colors: support green · resistance red-orange · VAH purple · POC amber · VAL cyan · EMA9 blue · EMA21 teal · VWAP dashed purple. "
+    st.caption("Colors: support green · resistance red-orange · VAH purple · POC amber · VAL cyan · EMA9 amber/yellow · EMA21 blue · VWAP dashed purple. "
                "Formations are labeled only when they form AT a level "
                "(zone, PDH/PDC/PDL, opening-range edge) — the book's rule. "
                "Mid-chart formations appear as faint markers.")
