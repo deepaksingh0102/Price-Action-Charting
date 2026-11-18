@@ -21,6 +21,19 @@ book (@FORRNEERO), drawn on the chart for any US stock:
     daily-chart patterns that take weeks to form; what is detected here
     are miniature fractal versions on one session of bars, and the
     book's reliability claims do not transfer to them.
+  * MINERVINI (Mark Minervini, "Trade Like a Stock Market Wizard", Ch. 5,
+    10, 13) — the TREND TEMPLATE checklist (SMA 50/150/200, 200-day
+    slope, 52-week high/low distances) with a four-stage label, computed
+    on daily bars at full scale; the VCP (volatility contraction pattern:
+    successive pullbacks each ~half the previous one, volume drying
+    across the sequence, ending in a tight pivot); and the PIVOT ENTRY
+    presentation on every pattern (pivot = trigger, stop = invalidation,
+    volume pace vs the average day, a "chased" warning when price has
+    run >0.50% past the pivot). The book's patterns are multi-week
+    daily-chart patterns; the intraday VCP is a fractal of the geometry,
+    and the book's reliability claims do not transfer to it. The
+    Template is daily context only — it never changes the weighted
+    confluence score.
   * CANDLESTICK FORMATIONS marked where they occur — highlighted ONLY when
     they form AT a level (the book's core rule: a candle mid-chart means
     nothing); mid-chart formations are drawn faint
@@ -74,7 +87,7 @@ ALPACA_BASE = "https://data.alpaca.markets/v2"
 # Version stamp: the footer shows this tag plus a hash computed live from
 # the deployed file itself, so the page proves which build is running —
 # compare it with the hash named when the file was delivered.
-BUILD_TAG = "2026-11-17"
+BUILD_TAG = "2026-11-18"
 
 
 def _build_hash() -> str:
@@ -91,6 +104,10 @@ LOAD_DAYS = 7            # calendar days of 1-min bars (covers ~5 sessions)
 DAILY_EMA_DAYS = 300     # calendar days of daily bars for the daily-EMA
                          # reference lines (~208 sessions — enough to warm
                          # a 200-day EMA); the 1-min frame is far too short
+DAILY_TEMPLATE_DAYS = 400  # calendar days of daily OHLCV for the Minervini
+                         # Trend Template: 252 sessions for the 52-week
+                         # high/low, plus SMA200 warm-up and the 1-month
+                         # slope lookback
 DAILY_EMA_MAX_DIST = 0.15  # a daily-EMA line more than 15% from the last
                            # price is hidden (it would stretch the price
                            # panel); its value is still named in the caption
@@ -201,16 +218,16 @@ def fetch_bars_1m(symbol: str, bucket: int = 0,
 
 
 @st.cache_data(show_spinner=False)
-def fetch_daily_closes(symbol: str, bucket: int = 0,
-                       days: int = DAILY_EMA_DAYS,
-                       end: str = "") -> pd.Series:
-    """Daily closes for the daily-EMA reference lines — one cheap 1Day-bars
-    pull. The 1-min frame only covers LOAD_DAYS (~5 sessions), far too
-    short for a 200-day EMA, so this is a separate fetch. `end` anchors
-    the window to a past session for the date view, mirroring
-    fetch_bars_1m. The index is the trading date (the UTC calendar date
-    of each daily bar) — that matches the session date in either of
-    Alpaca's daily-bar timestamp conventions."""
+def fetch_daily_bars(symbol: str, bucket: int = 0,
+                     days: int = DAILY_TEMPLATE_DAYS,
+                     end: str = "") -> pd.DataFrame:
+    """Daily OHLCV bars — one cheap 1Day-bars pull. The 1-min frame only
+    covers LOAD_DAYS (~5 sessions), far too short for a 200-day average
+    or a 52-week high/low, so this is a separate fetch. `end` anchors the
+    window to a past session for the date view, mirroring fetch_bars_1m.
+    The index is the trading date (the UTC calendar date of each daily
+    bar) — that matches the session date in either of Alpaca's daily-bar
+    timestamp conventions."""
     _, _, feed = _secrets()
     if end:
         end_et = datetime.strptime(end, "%Y-%m-%d").replace(
@@ -237,11 +254,30 @@ def fetch_daily_closes(symbol: str, bucket: int = 0,
         if not token:
             break
     if not rows:
-        return pd.Series(dtype=float)
+        return pd.DataFrame(
+            columns=["Open", "High", "Low", "Close", "Volume"])
     ts = pd.to_datetime([r["t"] for r in rows], utc=True)
-    closes = pd.Series([float(r["c"]) for r in rows],
-                       index=pd.DatetimeIndex(ts).date)
-    return closes.sort_index()
+    df = pd.DataFrame({
+        "Open": [float(r["o"]) for r in rows],
+        "High": [float(r["h"]) for r in rows],
+        "Low": [float(r["l"]) for r in rows],
+        "Close": [float(r["c"]) for r in rows],
+        "Volume": [float(r["v"]) for r in rows]},
+        index=pd.DatetimeIndex(ts).date)
+    return df.sort_index()
+
+
+@st.cache_data(show_spinner=False)
+def fetch_daily_closes(symbol: str, bucket: int = 0,
+                       days: int = DAILY_EMA_DAYS,
+                       end: str = "") -> pd.Series:
+    """Daily closes for the daily-EMA reference lines — the Close column
+    of fetch_daily_bars. Kept as its own function so the EMA path is
+    unchanged (same window, same values)."""
+    bars = fetch_daily_bars(symbol, bucket, days, end)
+    if bars.empty:
+        return pd.Series(dtype=float)
+    return bars["Close"]
 
 
 def daily_ema_levels(closes: pd.Series, session_date) -> dict | None:
@@ -265,6 +301,120 @@ def daily_ema_levels(closes: pd.Series, session_date) -> dict | None:
     if out["ema50"] is None and out["ema200"] is None:
         return None
     return out
+
+
+def trend_template(daily: pd.DataFrame, session_date) -> dict | None:
+    """Minervini's Trend Template (Ch. 5, p. 79) + four-stage label, from
+    daily OHLCV through the last COMPLETED session before `session_date`
+    — no lookahead. Simple moving averages per the book (NOT the app's
+    daily EMA lines — EMA and SMA disagree near crosses, and the book's
+    numbers are SMA). Needs >= 252 sessions (52-week high/low + SMA200
+    warm-up + the 1-month slope lookback); None when the history is too
+    short. Criterion 8 (IBD RS ranking >= 70) is vendor data the app
+    cannot compute — it is reported as n/a, never approximated. The
+    checklist is daily context only; it never changes the weighted
+    confluence score."""
+    if daily is None or daily.empty or len(daily) < 252:
+        return None
+    prior = daily[[d < session_date for d in daily.index]]
+    n = len(prior)
+    if n < 252:
+        return None
+    C = prior["Close"].astype(float)
+    H = prior["High"].astype(float)
+    L = prior["Low"].astype(float)
+    V = prior["Volume"].astype(float)
+    O = prior["Open"].astype(float)
+    sma = lambda k: float(C.rolling(k).mean().iloc[-1])
+    sma50, sma150, sma200 = sma(50), sma(150), sma(200)
+    sma200_s = C.rolling(200).mean()
+    sma200_21 = float(sma200_s.iloc[-22])
+    sma200_84 = float(sma200_s.iloc[-85])
+    c0 = float(C.iloc[-1])
+    high52 = float(H.tail(252).max())
+    low52 = float(L.tail(252).min())
+    criteria = [
+        {"label": f"Price ${c0:,.2f} above SMA150 ${sma150:,.2f} and "
+                  f"SMA200 ${sma200:,.2f}",
+         "met": bool(c0 > sma150 and c0 > sma200)},
+        {"label": f"SMA150 ${sma150:,.2f} above SMA200 ${sma200:,.2f}",
+         "met": bool(sma150 > sma200)},
+        {"label": f"SMA200 rising >= 1 month "
+                  f"(${sma200_21:,.2f} -> ${sma200:,.2f}; 4-5 mo: "
+                  f"${sma200_84:,.2f} -> ${sma200:,.2f})",
+         "met": bool(sma200 > sma200_21)},
+        {"label": f"SMA50 ${sma50:,.2f} above SMA150 and SMA200",
+         "met": bool(sma50 > sma150 and sma50 > sma200)},
+        {"label": f"Price ${c0:,.2f} above SMA50 ${sma50:,.2f}",
+         "met": bool(c0 > sma50)},
+        {"label": f"Price >= 30% above 52-week low ${low52:,.2f} "
+                  f"({(c0 / low52 - 1) * 100:.0f}% above)",
+         "met": bool(c0 >= 1.30 * low52)},
+        {"label": f"Price within 25% of 52-week high ${high52:,.2f} "
+                  f"({(1 - c0 / high52) * 100:.0f}% below)",
+         "met": bool(c0 >= 0.75 * high52)},
+        {"label": "RS ranking >= 70 — n/a (IBD data not available)",
+         "met": None},
+    ]
+    met = sum(1 for c in criteria[:7] if c["met"])
+
+    # Stage label (Weinstein's four stages, Minervini Ch. 5, pp. 63-78).
+    # Stage 2: Template trend criteria met + daily higher highs/lows
+    # stair-stepping + more volume on up days than down days (last 20).
+    # Stage 4: below a falling 200-day and near the 52-week low. Stage 1:
+    # below a FLAT 200-day (slope < 0.10% over a month — adaptation;
+    # "flat" is qualitative in the book). Stage 3: above the 200-day but
+    # the 200-day rolling over, or a major one-day break in the last 20
+    # sessions (decline > 3% — adaptation of "largest one-day decline",
+    # p. 73). Anything else: no label rather than a forced one.
+    slope21 = sma200 - sma200_21
+    slope_prev21 = sma200_21 - float(sma200_s.iloc[-43])
+    hi_idx, lo_idx = swing_points(prior, w=5)
+    hh_up = len(hi_idx) >= 2 and float(H.iloc[hi_idx[-1]]) > float(
+        H.iloc[hi_idx[-2]])
+    ll_up = len(lo_idx) >= 2 and float(L.iloc[lo_idx[-1]]) > float(
+        L.iloc[lo_idx[-2]])
+    last20 = prior.tail(20)
+    up_vol = float(V.tail(20)[C.tail(20) > O.tail(20)].sum())
+    dn_vol = float(V.tail(20)[C.tail(20) < O.tail(20)].sum())
+    worst_day = float((C.tail(20) / C.tail(20).shift(1) - 1).min())
+    if (all(c["met"] for c in criteria[:5]) and hh_up and ll_up
+            and up_vol > dn_vol):
+        stage = "Stage 2 (advancing)"
+    elif c0 < sma200 and slope21 < 0 and c0 <= 1.10 * low52:
+        stage = "Stage 4 (declining)"
+    elif c0 < sma200 and abs(slope21) / sma200 < 0.001:
+        stage = "Stage 1 (basing)"
+    elif c0 > sma200 and ((slope21 < 0 < slope_prev21)
+                          or worst_day < -0.03):
+        stage = "Stage 3 (topping)"
+    else:
+        stage = "Stage unclear — no label"
+    return {"asof": prior.index[-1], "n": n, "criteria": criteria,
+            "met": met, "stage": stage, "sma50": sma50, "sma150": sma150,
+            "sma200": sma200, "high52": high52, "low52": low52}
+
+
+def _volume_pace(disp: pd.DataFrame,
+                 avg_daily_vol: float | None) -> float | None:
+    """Projected day volume vs the average daily volume (Minervini's
+    intraday rule, p. 229): cumulative session volume / fraction of the
+    session elapsed, divided by the average daily volume. The book's
+    example is 300-400% of the average day; the app reports the number
+    and never gates on it — the 1.2x break-volume gate stays the
+    confirmation rule. None when it cannot be computed."""
+    if avg_daily_vol is None or avg_daily_vol <= 0 or len(disp) < 2:
+        return None
+    cum_vol = float(disp["Volume"].sum())
+    idx = disp.index
+    bar_min = (idx[1] - idx[0]).total_seconds() / 60.0
+    if bar_min <= 0:
+        return None
+    elapsed = (idx[-1] - idx[0]).total_seconds() / 60.0 + bar_min
+    frac = elapsed / 390.0
+    if frac <= 0 or frac > 1.5:
+        return None
+    return (cum_vol / frac) / avg_daily_vol
 
 
 # ---------------------------------------------------------------- indicators
@@ -876,6 +1026,16 @@ def _detect_flag_pattern(df: pd.DataFrame) -> dict | None:
                     # while the flag/pennant forms.
                     pause_vol = float(V[pole_end:end + 1].mean())
                     if pause_vol > 0.8 * pole_vol:
+                        continue
+                    # The pause must be RECENT: the fitted pause lines are
+                    # extrapolated to the last bar, so a stale pause's
+                    # lines drift and the level check below reads a
+                    # phantom break (a rising pause drifts above price
+                    # and fakes a breakdown — a Bear Flag with an upside
+                    # target). The range detector has the same tail-
+                    # freshness rule; the FORMING branch below is stricter
+                    # still (end >= n - 4).
+                    if end < n - 7:
                         continue
                     u_last = _line_at(upper, n - 1)
                     l_last = _line_at(lower, n - 1)
@@ -1528,6 +1688,162 @@ def _detect_broadening_pattern(df: pd.DataFrame) -> dict | None:
     return best
 
 
+def _detect_vcp_pattern(df: pd.DataFrame) -> dict | None:
+    """VCP — Volatility Contraction Pattern (Minervini, Ch. 10, pp.
+    198-206): successive pullbacks from a session high, each about half
+    the previous one ("about half (plus or minus a reasonable amount)",
+    p. 199), with volume drying up across the sequence, ending in a
+    tight pivot. The book's VCP is 3-65 weeks on daily bars; the
+    intraday version is a fractal — the geometry and confirmation logic
+    transfer, the durations and percent depths do not, and every
+    threshold below that comes from the book's daily scale is marked as
+    an adaptation. What makes it NOT a duplicate of the range/flag
+    detectors: the range checks one width, the flag one pole + one
+    pause; the VCP checks a SEQUENCE of contractions getting tighter
+    left-to-right with volume drying at each step. A V-shape (one
+    straight down-leg, no intervening rally) is rejected as time
+    compression (pp. 211-212), not a VCP."""
+    n = len(df)
+    if n < 30:
+        return None
+    C = df["Close"].to_numpy()
+    V = df["Volume"].to_numpy()
+    L = df["Low"].to_numpy()
+    pts = _alternating_swings(df)
+    if len(pts) < 5:
+        return None
+    med_vol = float(np.median(V)) if n else 0.0
+    # Anchor: the highest swing high with a >= 0.50% up-leg from the
+    # session low before it (adaptation: the book requires a prior
+    # advance of >= 25% over 3-36 months, p. 243 — a single session
+    # cannot show that; the 0.50% intraday leg is the fractal stand-in).
+    # Try swing highs in descending price order; the first that yields a
+    # valid contraction sequence wins.
+    highs = sorted((p for p in pts if p[1] == "H"),
+                   key=lambda p: -p[2])
+    for (h0_i, _, h0_v) in highs:
+        lo_before = float(L[:h0_i + 1].min())
+        if (h0_v - lo_before) / h0_v < 0.0050:
+            continue
+        rest = [p for p in pts if p[0] > h0_i]
+        if len(rest) < 4 or rest[0][1] != "L":
+            continue
+        # Contractions: (high bar, high val, low bar, low val) — the
+        # first from H0 to L1, then from each rally high to the next low.
+        contr = []
+        cur_h = (h0_i, h0_v)
+        j = 0
+        while j < len(rest) and len(contr) < 6:
+            li, _, lv = rest[j]
+            if rest[j][1] != "L":
+                break
+            contr.append((cur_h[0], cur_h[1], li, lv))
+            if j + 1 >= len(rest) or rest[j + 1][1] != "H":
+                break
+            cur_h = (rest[j + 1][0], rest[j + 1][2])
+            j += 2
+        if len(contr) < 2:
+            continue
+        depths = [(hv - lv) / hv for (_, hv, _, lv) in contr]
+        # Each contraction ~half the previous one (loose bound 0.65x).
+        if any(depths[i + 1] > 0.65 * depths[i]
+               for i in range(len(depths) - 1)):
+            continue
+        # Last contraction tight: <= 0.30% of price (adaptation of the
+        # book's 2-3% final pullbacks on daily bars, scaled down roughly
+        # an order of magnitude for a single session).
+        if depths[-1] > 0.0030:
+            continue
+        # No V-shape: every rally between contractions must retrace at
+        # least 0.10% off its low.
+        rallies = []
+        for i in range(len(contr) - 1):
+            _, _, li, lv = contr[i]
+            hj = contr[i + 1][0]
+            rallies.append((C[hj] - lv) / lv if lv > 0 else 0.0)
+        if any(r < 0.0010 for r in rallies):
+            continue
+        # Volume drying across the sequence: last contraction's mean
+        # volume <= 0.70x the first contraction's, and at least one bar
+        # in the last contraction below the session-median bar volume
+        # (adaptation of "final-contraction volume below the 50-day
+        # average, with one or two days extremely low", p. 226).
+        def _cvol(a, b):
+            return float(V[a:b + 1].mean()) if b >= a else 0.0
+        cvols = [_cvol(hb, lb) for (hb, _, lb, _) in contr]
+        if cvols[0] <= 0 or cvols[-1] > 0.70 * cvols[0]:
+            continue
+        last_lo_bar = contr[-1][2]
+        last_hi_bar = contr[-1][0]
+        if not any(v < med_vol for v in V[last_hi_bar:last_lo_bar + 1]):
+            continue
+        # Pivot = the last contraction's high; it must be recent (same
+        # 30-bar recency convention as the H&S / double-top detectors).
+        pivot = contr[-1][1]
+        pivot_i = contr[-1][0]
+        if n - 1 - pivot_i > 30:
+            continue
+        last_low = contr[-1][3]
+        start = h0_i
+        end = last_lo_bar
+        footprint = (f"{len(contr)}T · "
+                     + " → ".join(f"{d * 100:.1f}%" for d in depths)
+                     + " · vol drying")
+        score = 40.0
+        if len(contr) >= 3:
+            score += 10
+        if cvols[-1] == min(cvols):
+            score += 5
+        score += min(end - start, 60) * 0.25 - (n - 1 - pivot_i)
+        vals = [pivot] * n
+        low_vals = [last_low] * n
+        cross_up = _line_cross(C, vals, n, 1)
+        cross_dn = _line_cross(C, low_vals, n, -1)
+        if cross_up is not None:
+            brk_vol = _break_vol_ratio(V, start, end, cross_up)
+            if brk_vol < 1.2:
+                status, bias = "FORMING", "bull"
+                trigger, invalidation = pivot, last_low
+                vol_note = " · breakout lacks volume"
+                label_x, label_y = pivot_i, pivot
+            else:
+                status, bias = "BREAKOUT CONFIRMED", "bull"
+                trigger, invalidation = pivot, last_low
+                vol_note = f" · vol ×{brk_vol:.1f} on break"
+                score += 25
+                label_x, label_y = cross_up, vals[cross_up]
+        elif cross_dn is not None:
+            # A VCP that breaks down is a failed base, not a short
+            # signal — Minervini is long-only in stage 2.
+            status, bias = "BREAKDOWN CONFIRMED", "bear"
+            trigger, invalidation = last_low, pivot
+            vol_note = " · base failed — VCP broken"
+            score += 25
+            label_x, label_y = cross_dn, low_vals[cross_dn]
+        else:
+            status, bias = "FORMING", "bull"
+            trigger, invalidation = pivot, last_low
+            vol_note = ""
+            label_x, label_y = pivot_i, pivot
+        detail = (f"{footprint} · no measured target (Minervini)"
+                  f"{vol_note}")
+        seq_pts = [(h0_i, h0_v)]
+        for k, (hb, hv, lb, lv) in enumerate(contr):
+            seq_pts.append((lb, lv))
+            if k + 1 < len(contr):
+                seq_pts.append((contr[k + 1][0], contr[k + 1][1]))
+        segs = []
+        for k in range(len(seq_pts) - 1):
+            segs.append({"x0": seq_pts[k][0], "y0": seq_pts[k][1],
+                         "x1": seq_pts[k + 1][0],
+                         "y1": seq_pts[k + 1][1]})
+        return _make_chart_pattern(
+            "VCP — Volatility Contraction", bias, status, start, end,
+            segs, label_x, label_y, trigger, invalidation, detail,
+            score, "continuation")
+    return None
+
+
 def detect_chart_patterns(df: pd.DataFrame) -> list[dict]:
     """Current chart-pattern recognition for the displayed session. Returns
     at most three non-duplicative patterns, confirmed breaks first."""
@@ -1536,7 +1852,8 @@ def detect_chart_patterns(df: pd.DataFrame) -> list[dict]:
                      _detect_flag_pattern, _detect_staircase_pattern,
                      _detect_head_shoulders_pattern,
                      _detect_double_top_pattern,
-                     _detect_broadening_pattern):
+                     _detect_broadening_pattern,
+                     _detect_vcp_pattern):
         try:
             pattern = detector(df)
         except Exception:
@@ -1551,6 +1868,14 @@ def detect_chart_patterns(df: pd.DataFrame) -> list[dict]:
         hi = min(a["end"], b["end"])
         span = max(a["end"] - a["start"], b["end"] - b["start"], 1)
         return max(0, hi - lo) / span
+
+    def _dup_group(fam: str) -> str:
+        # A VCP is a continuation base; when it sits on the same bars as
+        # a range/flag/triangle it is the same observation (Minervini: a
+        # flat base without contraction is still a valid base, p. 199) —
+        # so the VCP dedups against the consolidation family, not only
+        # against itself.
+        return "consolidation" if fam == "continuation" else fam
 
     def specificity(pattern: dict) -> int:
         # When geometries overlap, a converging or pole-based pattern is a
@@ -1571,8 +1896,10 @@ def detect_chart_patterns(df: pd.DataFrame) -> list[dict]:
             # An H&S and a double top built from the same swings are the
             # same observation (Murphy: H&S vs triple-top is "academic",
             # p. 115) — keep the higher score, as for consolidations.
-            if pattern["family"] == other["family"] \
-                    and pattern["family"] in ("consolidation", "reversal") \
+            if _dup_group(pattern["family"]) \
+                    == _dup_group(other["family"]) \
+                    and pattern["family"] in (
+                        "consolidation", "reversal", "continuation") \
                     and overlap(pattern, other) >= 0.60:
                 duplicate = True
                 break
@@ -2194,6 +2521,20 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
                               dash="solid" if pat["family"] != "staircase"
                               else "dashdot")),
                     row=1, col=1)
+            # Minervini pivot line (Ch. 10, p. 223): the trigger is the
+            # "call to action" level, drawn dashed from the pattern
+            # start to the right edge for FORMING patterns as well as
+            # confirmed ones — "let the stock break above the pivot and
+            # prove itself" (p. 229). A shape, not a trace, so it never
+            # stretches the price axis; a far pivot stays drawn but
+            # off-view, like every other level.
+            if pat.get("trigger") is not None:
+                fig.add_shape(
+                    type="line", xref="x", yref="y",
+                    x0=x[pat["start"]], x1=x[-1],
+                    y0=pat["trigger"], y1=pat["trigger"],
+                    line=dict(color=color, width=1.2, dash="dash"),
+                    row=1, col=1)
             label = f"{pat['name']}<br>{pat['status']}"
             fig.add_trace(go.Scatter(
                 x=[x[pat["label_x"]]], y=[pat["label_y"]],
@@ -2413,12 +2754,16 @@ with st.sidebar:
         "chart_patterns": st.checkbox(
             "Pattern recognition (ranges, triangles, wedges, flags, "
             "pennants, staircases, head & shoulders, double tops/bottoms, "
-            "broadening formations)", value=True),
+            "broadening formations, volatility contraction (VCP))",
+            value=True),
         "patterns": st.checkbox("Candlestick formations", value=True),
         "phases": st.checkbox("Time-cycle phases", value=True),
         "ema_long": st.checkbox("EMA 50 / 200 (trend context)", value=True),
         "daily_ema": st.checkbox("Daily EMA 50 / 200 reference lines",
                                  value=True),
+        "trend_template": st.checkbox(
+            "Trend Template (Minervini) — daily SMA 50/150/200, "
+            "52-week high/low, stage label", value=True),
         "volume_profile": st.checkbox(
             "Volume profile (POC / value area)", value=True),
     }
@@ -2478,6 +2823,37 @@ def render():
     lines = trendlines(disp)
     vp = session_volume_profile(disp)
     chart_pats = detect_chart_patterns(disp)
+
+    # Minervini daily context (Trend Template + volume pace): one daily
+    # OHLCV pull on a slow daily bucket, shared by both. A failed or
+    # too-short pull just hides the Template and the pace, never the
+    # chart — the intraday detectors do not depend on it.
+    daily_bars = None
+    template = None
+    avg_daily_vol = None
+    if show.get("trend_template") or show.get("chart_patterns"):
+        try:
+            daily_bars = fetch_daily_bars(
+                symbol,
+                _bucket(live, int(refresh_secs), bucket_secs=86400),
+                end=view_date.isoformat() if past_mode else "")
+        except Exception:
+            daily_bars = None
+    if daily_bars is not None and not daily_bars.empty:
+        if show.get("trend_template"):
+            try:
+                template = trend_template(daily_bars, sel_date)
+            except Exception:
+                template = None
+        try:
+            prior_vol = daily_bars["Volume"][
+                [d < sel_date for d in daily_bars.index]]
+            if len(prior_vol) >= 20:
+                avg_daily_vol = float(prior_vol.mean())
+        except Exception:
+            avg_daily_vol = None
+    vol_pace = (_volume_pace(disp, avg_daily_vol)
+                if chart_pats else None)
     pats = candle_patterns(disp)
     level_vals = ([pa["PDH"], pa["PDC"], pa["PDL"]] if pa else []) \
         + [z["center"] for z in zones] \
@@ -2608,24 +2984,67 @@ def render():
             st.caption("Daily EMA 50 / 200 reference lines unavailable — "
                        "daily bars could not be loaded for this session.")
 
+    if show.get("trend_template"):
+        if template:
+            lines = [f"**Trend Template (Minervini)** — "
+                     f"{template['met']}/7 met · {template['stage']}"]
+            for c in template["criteria"]:
+                mark = ("✓" if c["met"] is True
+                        else "✗" if c["met"] is False else "—")
+                lines.append(f"- {mark} {c['label']}")
+            st.markdown("\n".join(lines))
+            st.caption("Minervini's Trend Template (Ch. 5, p. 79) on "
+                       "daily bars through "
+                       f"{template['asof']} ({template['n']} sessions). "
+                       "Simple moving averages per the book — not the "
+                       "app's daily EMA lines. RS ranking is IBD data "
+                       "and is not available here. Context only — it "
+                       "does not change the weighted confluence score.")
+        else:
+            st.caption("Trend Template unavailable — need 252 daily "
+                       "sessions; daily bars could not be loaded for "
+                       "this session.")
+
     if show.get("chart_patterns"):
         st.markdown("**Pattern recognition** (the book's chart patterns — "
-                    "ranges, triangles, wedges, flags/pennants and "
-                    "staircases):")
+                    "ranges, triangles, wedges, flags/pennants, "
+                    "staircases, head & shoulders, double tops/bottoms, "
+                    "broadening formations, volatility contraction (VCP)):")
         if chart_pats:
             icons = {"bull": "🟢", "bear": "🔴", "neutral": "🟣"}
             rows = []
             for pat in chart_pats:
-                trigger = (f"trigger ${pat['trigger']:,.2f}"
-                           if pat["trigger"] is not None else "trigger —")
-                invalid = (f"invalidation ${pat['invalidation']:,.2f}"
+                # Minervini pivot entry (Ch. 10, p. 223): the trigger IS
+                # the pivot — the "call to action" level — and the
+                # invalidation IS the stop. The book's 7-8% daily stop
+                # does not transfer intraday (7% of QQQ is ~$46);
+                # the pattern's own invalidation level is the
+                # intraday equivalent of the stop.
+                trigger = (f"Pivot ${pat['trigger']:,.2f}"
+                           if pat["trigger"] is not None else "Pivot —")
+                invalid = (f"Stop ${pat['invalidation']:,.2f} "
+                           f"(invalidation)"
                            if pat["invalidation"] is not None
-                           else "invalidation —")
+                           else "Stop —")
+                extra = ""
+                if vol_pace is not None:
+                    extra += f" · vol pace ×{vol_pace:.1f} of avg day"
+                if (pat["status"] == "BREAKOUT CONFIRMED"
+                        and pat["trigger"] is not None):
+                    run = (float(last["Close"]) / pat["trigger"] - 1) * 100
+                    if run > 0.50:
+                        extra += (f" · chased: price is {run:.1f}% above "
+                                  f"the pivot — wait for a pullback")
                 rows.append(
                     f"- {icons.get(pat['bias'], '🟣')} **{pat['name']} — "
                     f"{pat['status']}** · {trigger} · {invalid} · "
-                    f"{pat['detail']}")
+                    f"{pat['detail']}{extra}")
             st.markdown("\n".join(rows))
+            if template and template["stage"].startswith("Stage 4"):
+                st.caption("⚠️ These patterns fired in a Stage 4 "
+                           "(declining) daily context — Minervini would "
+                           "not buy a base here (p. 190). The patterns "
+                           "are shown, not suppressed.")
         else:
             st.caption("No qualifying chart pattern in the current session "
                        "yet. The detector requires a repeated range, "
@@ -2719,6 +3138,21 @@ with st.expander("How to read this chart"):
         "invalidation is the opposite boundary. A flag/pennant is only "
         "recognized after a fierce pole followed by a small contained "
         "pause, as the book defines it.\n"
+        "- **Minervini: Trend Template, VCP, pivot** — the Template panel "
+        "under the chart checks the stock against the book's eight "
+        "criteria (SMA 50/150/200, 200-day slope, 52-week high/low) on "
+        "daily bars and names the life-cycle stage (2 = advancing, 4 = "
+        "declining); a range in a Stage 4 context is shown, not "
+        "suppressed, with a warning. A **VCP** is a sequence of "
+        "successive pullbacks each about half the previous one with "
+        "volume drying up — the pivot is the last contraction's high. "
+        "Every pattern's trigger is labeled **Pivot** and its "
+        "invalidation **Stop**: buy at the pivot, don't chase more than "
+        "a few points past it (the list flags a chased break), and the "
+        "volume pace tells you how the day's volume is running versus "
+        "the average day. The book's patterns take weeks on daily "
+        "charts; the intraday VCP is a miniature of the geometry, not "
+        "of the book's reliability.\n"
         "- **Triangles / diamonds on the candles** — candlestick formations. "
         "Labeled ones formed **at a level** (that's when the book says they "
         "count); faint unlabeled ones formed mid-chart and are shown for "
