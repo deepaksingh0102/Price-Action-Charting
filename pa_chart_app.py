@@ -10,6 +10,17 @@ book (@FORRNEERO), drawn on the chart for any US stock:
     flags/pennants after a fierce pole, and staircase push-pause sequences;
     each detected pattern is outlined and labeled FORMING, ACTIVE, or
     BREAKOUT / BREAKDOWN CONFIRMED with its trigger and invalidation levels
+  * MURPHY REVERSAL PATTERNS (John J. Murphy, "Technical Analysis of the
+    Financial Markets", Ch. 5-6) — head & shoulders top / inverse bottom,
+    double tops & bottoms (triple variant folded in), and broadening
+    formations / megaphones; strict detectors in the same style, with the
+    book's confirmation rules (close beyond the line, never intraday
+    penetration alone), volume confirmation on breakouts (essential at
+    bottoms, advisory at tops), and measured minimum targets projected
+    from the pattern height. Intraday note: the book's patterns are
+    daily-chart patterns that take weeks to form; what is detected here
+    are miniature fractal versions on one session of bars, and the
+    book's reliability claims do not transfer to them.
   * CANDLESTICK FORMATIONS marked where they occur — highlighted ONLY when
     they form AT a level (the book's core rule: a candle mid-chart means
     nothing); mid-chart formations are drawn faint
@@ -63,7 +74,7 @@ ALPACA_BASE = "https://data.alpaca.markets/v2"
 # Version stamp: the footer shows this tag plus a hash computed live from
 # the deployed file itself, so the page proves which build is running —
 # compare it with the hash named when the file was delivered.
-BUILD_TAG = "2026-11-16-EMA-COLORS"
+BUILD_TAG = "2026-11-17"
 
 
 def _build_hash() -> str:
@@ -516,6 +527,7 @@ def _detect_range_pattern(df: pd.DataFrame) -> dict | None:
     H = df["High"].to_numpy()
     L = df["Low"].to_numpy()
     C = df["Close"].to_numpy()
+    V = df["Volume"].to_numpy()
     all_highs, all_lows = swing_points(df, w=3)
     best = None
     for end in range(n - 1, max(11, n - 31), -1):
@@ -543,6 +555,7 @@ def _detect_range_pattern(df: pd.DataFrame) -> dict | None:
             if upper_tests < 2 or lower_tests < 2:
                 continue
             status, bias = "FORMING", "neutral"
+            brk_i = None
             if end < n - 1:
                 tail = C[end + 1:]
                 above = np.where(tail > hi * 1.0003)[0]
@@ -555,6 +568,7 @@ def _detect_range_pattern(df: pd.DataFrame) -> dict | None:
                         continue
                     if C[-1] < lo:
                         continue
+                    brk_i = event_i
                     status = ("BREAKOUT CONFIRMED" if C[-1] >= hi
                               else "BREAKOUT / BACK IN RANGE")
                     bias = "bull"
@@ -564,6 +578,7 @@ def _detect_range_pattern(df: pd.DataFrame) -> dict | None:
                         continue
                     if C[-1] > hi:
                         continue
+                    brk_i = event_i
                     status = ("BREAKDOWN CONFIRMED" if C[-1] <= lo
                               else "BREAKDOWN / BACK IN RANGE")
                     bias = "bear"
@@ -571,16 +586,38 @@ def _detect_range_pattern(df: pd.DataFrame) -> dict | None:
                     continue
             trigger = hi if bias != "bear" else lo
             invalidation = lo if bias != "bear" else hi
+            # Murphy (Ch. 7): a breakout should come on heavier volume —
+            # essential at bottoms, advisory at tops. The measured target
+            # is the range height projected from the break (p. 151).
+            vol_note = ""
+            target_note = ""
+            vol_bonus = 0
+            if brk_i is not None:
+                brk_vol = _break_vol_ratio(V, start, end, brk_i)
+                vol_note = f" · vol ×{brk_vol:.1f} on break"
+                if status == "BREAKOUT CONFIRMED":
+                    if brk_vol < 1.2:
+                        status = "FORMING"
+                        vol_note += " — breakout lacks volume"
+                    else:
+                        target_note = (f" · target "
+                                       f"${hi + (hi - lo):,.2f} (min)")
+                elif status == "BREAKDOWN CONFIRMED":
+                    if brk_vol >= 1.5:
+                        vol_bonus = 8
+                    target_note = (f" · target "
+                                   f"${lo - (hi - lo):,.2f} (min)")
             score = (upper_tests + lower_tests) * 10 + min(length, 60) \
                 + (30 if status != "FORMING" else 12) - width * 3 \
-                - abs(n - 1 - end)
+                - abs(n - 1 - end) + vol_bonus
             cand = _make_chart_pattern(
                 "Range / Consolidation", bias, status, start, n - 1,
                 [{"x0": start, "y0": hi, "x1": n - 1, "y1": hi},
                  {"x0": start, "y0": lo, "x1": n - 1, "y1": lo}],
                 start, hi, trigger, invalidation,
                 f"{length} bars · {upper_tests} upper tests / "
-                f"{lower_tests} lower tests · width {width:.2f}%",
+                f"{lower_tests} lower tests · width {width:.2f}%"
+                f"{vol_note}{target_note}",
                 score, "consolidation",
                 box={"x0": start, "x1": n - 1, "y0": lo, "y1": hi})
             if best is None or cand["score"] > best["score"]:
@@ -598,6 +635,7 @@ def _detect_triangle_pattern(df: pd.DataFrame) -> dict | None:
     H = df["High"].to_numpy()
     L = df["Low"].to_numpy()
     C = df["Close"].to_numpy()
+    V = df["Volume"].to_numpy()
     all_highs, all_lows = swing_points(df, w=3)
     best = None
     for end in range(n - 1, max(14, n - 31), -1):
@@ -696,9 +734,39 @@ def _detect_triangle_pattern(df: pd.DataFrame) -> dict | None:
                 elif name == "Descending Triangle":
                     bias = "bear"
                 trigger, invalidation = u_last, l_last
+            # Murphy (Ch. 6-7): breakout between 2/3 and 3/4 of the
+            # base-to-apex width, or the triangle loses potency (p. 133);
+            # a breakout should come on heavier volume (essential on the
+            # upside); the measured target is the base height projected
+            # from the breakout point (p. 135).
+            apex_penalty = 0
+            if upper[0] != lower[0]:
+                apex_x = (lower[1] - upper[1]) / (upper[0] - lower[0])
+                if apex_x > first and \
+                        (n - 1) > first + 0.75 * (apex_x - first):
+                    apex_penalty = 15
+            vol_note = ""
+            target_note = ""
+            vol_bonus = 0
+            if status in ("BREAKOUT CONFIRMED", "BREAKDOWN CONFIRMED"):
+                brk_vol = _break_vol_ratio(V, first, end, cross_i)
+                vol_note = f" · vol ×{brk_vol:.1f} on break"
+                if status == "BREAKOUT CONFIRMED":
+                    if brk_vol < 1.2:
+                        status = "FORMING"
+                        vol_note += " — breakout lacks volume"
+                    else:
+                        target_note = (f" · target "
+                                       f"${u_last + start_width:,.2f} (min)")
+                else:
+                    if brk_vol >= 1.5:
+                        vol_bonus = 8
+                    target_note = (f" · target "
+                                   f"${l_last - start_width:,.2f} (min)")
             score = len(highs) + len(lows) + containment * 20 \
                 + (1.0 - compression) * 25 + min(end - first, 60) * 0.25 \
-                + (25 if status != "FORMING" else 8)
+                + (25 if status != "FORMING" else 8) \
+                + vol_bonus - apex_penalty
             cand = _make_chart_pattern(
                 name, bias, status, first, n - 1,
                 [{"x0": first, "y0": u0, "x1": n - 1, "y1": u_last},
@@ -707,7 +775,8 @@ def _detect_triangle_pattern(df: pd.DataFrame) -> dict | None:
                 trigger, invalidation,
                 f"{len(highs)} swing highs / {len(lows)} swing lows · "
                 f"range compressed to {compression:.0%} · "
-                f"{containment:.0%} contained",
+                f"{containment:.0%} contained"
+                f"{vol_note}{target_note}",
                 score, "consolidation")
             if best is None or cand["score"] > best["score"]:
                 best = cand
@@ -803,6 +872,11 @@ def _detect_flag_pattern(df: pd.DataFrame) -> dict | None:
                               & (C[seg] >= _line_at(lower, xs) - tol))
                     if float(inside.mean()) < 0.82:
                         continue
+                    # Murphy (p. 143): volume should dry up noticeably
+                    # while the flag/pennant forms.
+                    pause_vol = float(V[pole_end:end + 1].mean())
+                    if pause_vol > 0.8 * pole_vol:
+                        continue
                     u_last = _line_at(upper, n - 1)
                     l_last = _line_at(lower, n - 1)
                     if direction == 1:
@@ -831,9 +905,33 @@ def _detect_flag_pattern(df: pd.DataFrame) -> dict | None:
                     name = ("Bull " if direction == 1 else "Bear ") + kind
                     pole_y0 = base
                     pole_y1 = extreme
+                    # Murphy (Ch. 7): a breakout should come on heavier
+                    # volume — essential on the upside. The measured target
+                    # is the pole length projected from the breakout
+                    # ("fly at half-mast", pp. 143-144).
+                    vol_note = ""
+                    target_note = ""
+                    vol_bonus = 0
+                    if status in ("BREAKOUT CONFIRMED",
+                                  "BREAKDOWN CONFIRMED"):
+                        brk_vol = _break_vol_ratio(V, pole_start, end, n - 1)
+                        vol_note = f" · vol ×{brk_vol:.1f} on break"
+                        if status == "BREAKOUT CONFIRMED":
+                            if brk_vol < 1.2:
+                                status = "FORMING"
+                                vol_note += " — breakout lacks volume"
+                            else:
+                                target_note = (f" · target "
+                                               f"${u_last + move_abs:,.2f} "
+                                               f"(min)")
+                        else:
+                            if brk_vol >= 1.5:
+                                vol_bonus = 8
+                            target_note = (f" · target "
+                                           f"${l_last - move_abs:,.2f} (min)")
                     score = move * 8 + min(vol_ratio, 2.0) * 8 \
                         + float(inside.mean()) * 15 + min(cons_len, 30) \
-                        + (25 if status != "FORMING" else 8)
+                        + (25 if status != "FORMING" else 8) + vol_bonus
                     cand = _make_chart_pattern(
                         name, bias, status, pole_start, n - 1,
                         [{"x0": pole_start, "y0": pole_y0,
@@ -847,7 +945,8 @@ def _detect_flag_pattern(df: pd.DataFrame) -> dict | None:
                         trigger, invalidation,
                         f"pole {move:.2f}% in {pole_len + 1} bars · "
                         f"pole volume {vol_ratio:.2f}x prior · "
-                        f"pause {cons_len + 1} bars",
+                        f"pause {cons_len + 1} bars"
+                        f"{vol_note}{target_note}",
                         score, "consolidation")
                     if best is None or cand["score"] > best["score"]:
                         best = cand
@@ -930,12 +1029,514 @@ def _detect_staircase_pattern(df: pd.DataFrame) -> dict | None:
     return best
 
 
+# ---------------------------------------------------------------- Murphy reversal patterns
+# John J. Murphy, "Technical Analysis of the Financial Markets", Ch. 5-6.
+# The book's patterns are daily-chart patterns that take weeks to form; the
+# detectors below find miniature fractal versions on one session of bars.
+# Strict by design (same philosophy as the other detectors): geometry gates
+# are hard, confirmation is a CLOSE beyond the line (never intraday
+# penetration alone), and a pattern that does not qualify is not drawn.
+# Bar-count and height minimums are intraday adaptations — the book gives
+# durations in weeks/months, which cannot exist in one session.
+
+def _vol_str(v: float) -> str:
+    if v >= 1_000_000:
+        return f"{v / 1_000_000:.1f}M"
+    if v >= 1_000:
+        return f"{v / 1_000:.0f}k"
+    return f"{v:.0f}"
+
+
+def _alternating_swings(df: pd.DataFrame) -> list[tuple[int, str, float]]:
+    """Swing points as an alternating H/L sequence [(idx, kind, price)].
+    Consecutive same-kind swings collapse to the most extreme one."""
+    H = df["High"].to_numpy()
+    L = df["Low"].to_numpy()
+    highs, lows = swing_points(df, w=3)
+    raw = [(i, "H", float(H[i])) for i in highs]
+    raw += [(i, "L", float(L[i])) for i in lows]
+    raw.sort()
+    points: list[tuple[int, str, float]] = []
+    for point in raw:
+        if points and points[-1][1] == point[1]:
+            prev = points[-1]
+            if (point[1] == "H" and point[2] > prev[2]) or \
+                    (point[1] == "L" and point[2] < prev[2]):
+                points[-1] = point
+        else:
+            points.append(point)
+    return points
+
+
+def _line_cross(C, vals, n, side, pct=0.0010, window=7):
+    """Fresh close beyond a line, Murphy-style: a close beyond the line by
+    >= pct of the line value, OR two consecutive closes beyond it (the
+    intraday analog of the book's two-day rule), with the crossing bar
+    inside the last `window` bars. side=-1: break below; +1: break above.
+    Returns the crossing bar index, or None (no break, or a stale one)."""
+    def s(j, buffer):
+        lo = vals[j] * (1.0 - buffer)
+        hi = vals[j] * (1.0 + buffer)
+        if side < 0:
+            if C[j] < lo:
+                return -1
+            if C[j] > hi:
+                return 1
+            return 0
+        if C[j] > hi:
+            return 1
+        if C[j] < lo:
+            return -1
+        return 0
+    if s(n - 1, pct) == side:
+        for j in range(max(1, n - window), n):
+            if s(j, pct) == side and s(j - 1, pct) != side:
+                return j
+        return None
+    if s(n - 1, 0.0) == side and s(n - 2, 0.0) == side:
+        for j in range(max(1, n - window), n):
+            if s(j, 0.0) == side and s(j - 1, 0.0) != side:
+                return j
+    return None
+
+
+def _break_vol_ratio(V, start, end, brk_i):
+    """Breakout-bar volume vs the median bar volume inside the pattern
+    window. Local median only — 1-min volume has a strong session U-shape,
+    so a session average would mislabel most morning breakouts."""
+    window = V[start:end + 1]
+    med = float(np.median(window)) if len(window) else 0.0
+    if med <= 0:
+        return 0.0
+    return float(V[brk_i]) / med
+
+
+def _detect_head_shoulders_pattern(df: pd.DataFrame) -> dict | None:
+    """Head & Shoulders top / Inverse Head & Shoulders bottom (Murphy
+    Ch. 5, pp. 103-112): three peaks/troughs, the middle one the head,
+    neckline through the two intervening reaction points. The book's most
+    reliable reversal pattern — and the one with the most specific volume
+    rules: right-shoulder volume lightest; at bottoms, heavy volume on the
+    neckline break is absolutely essential."""
+    n = len(df)
+    if n < 30:
+        return None
+    H = df["High"].to_numpy()
+    L = df["Low"].to_numpy()
+    C = df["Close"].to_numpy()
+    V = df["Volume"].to_numpy()
+    pts = _alternating_swings(df)
+    if len(pts) < 5:
+        return None
+    mid = float(np.median(C))
+    best = None
+    for direction in (1, -1):
+        # direction 1: top (H L H L H); -1: bottom (L H L H L).
+        want = "HLHLH" if direction == 1 else "LHLHL"
+        for e in range(4, len(pts)):
+            seq = pts[e - 4:e + 1]
+            if "".join(p[1] for p in seq) != want:
+                continue
+            (i1, _, p1), (i2, _, p2), (i3, _, p3), (i4, _, p4), (i5, _, p5) = seq
+            if i5 - i1 < 25 or n - 1 - i5 > 30:
+                continue
+            if min(i2 - i1, i3 - i2, i4 - i3, i5 - i4) < 5:
+                continue
+            if i1 < 5:
+                continue
+            # Prior-trend gate (Murphy preliminary point #1): the pattern
+            # must reverse something visible — the left shoulder sits at
+            # least 0.40% beyond the extreme that preceded it.
+            if direction == 1:
+                if p1 < float(L[:i1].min()) * 1.0040:
+                    continue
+            else:
+                if p1 > float(H[:i1].max()) * 0.9960:
+                    continue
+            neck = _fit_line([i2, i4], [p2, p4])
+            if neck is None:
+                continue
+            head = p3
+            neck_head = _line_at(neck, i3)
+            height = abs(head - neck_head)
+            # Head must be the extreme, and clearly so.
+            if direction == 1:
+                if not (head > p1 and head > p5):
+                    continue
+                if head - max(p1, p5) < 0.0015 * mid:
+                    continue
+                # Shoulders about the same height.
+                if abs(p5 - p1) > max(0.0015 * mid, 0.30 * height):
+                    continue
+            else:
+                if not (head < p1 and head < p5):
+                    continue
+                if min(p1, p5) - head < 0.0015 * mid:
+                    continue
+                if abs(p5 - p1) > max(0.0015 * mid, 0.30 * height):
+                    continue
+            # Volume: per-peak mean over the 5 bars ending at each peak.
+            def _peak_vol(idx):
+                return float(V[max(0, idx - 4):idx + 1].mean())
+            v1, v2, v3 = _peak_vol(i1), _peak_vol(i3), _peak_vol(i5)
+            score = 40.0
+            if direction == 1:
+                if v2 < v1:
+                    score += 5
+                if v3 < v2 and v3 < v1:
+                    score += 10
+            else:
+                # Rally from the head should run on heavier volume than
+                # the rally from the left shoulder (Murphy p. 112).
+                rally_head = float(V[i3:i4 + 1].mean()) if i4 > i3 else 0.0
+                rally_left = float(V[i1:i2 + 1].mean()) if i2 > i1 else 0.0
+                if rally_head > rally_left:
+                    score += 10
+            # Right-shoulder retracement: often 1/2 to 2/3 of the C->D leg.
+            if direction == 1:
+                retrace = (p5 - p4) / (p3 - p4) if p3 != p4 else 0.0
+            else:
+                retrace = (p4 - p5) / (p4 - p3) if p4 != p3 else 0.0
+            if 0.50 <= retrace <= 0.66:
+                score += 5
+            # Neckline slope: tops usually slope slightly up, bottoms down.
+            if (direction == 1 and neck[0] > 0) or \
+                    (direction == -1 and neck[0] < 0):
+                score += 5
+            score += min(i5 - i1, 60) * 0.25 - (n - 1 - i5)
+            vals = neck[0] * np.arange(n) + neck[1]
+            neck_last = _line_at(neck, n - 1)
+            side = -1 if direction == 1 else 1
+            cross = _line_cross(C, vals, n, side)
+            name = "Head & Shoulders Top" if direction == 1 \
+                else "Inverse Head & Shoulders"
+            target = None
+            vol_note = ""
+            if cross is not None:
+                brk_vol = _break_vol_ratio(V, i1, i5, cross)
+                if direction == 1:
+                    status, bias = "BREAKDOWN CONFIRMED", "bear"
+                    trigger, invalidation = vals[cross], head
+                    target = vals[cross] - height
+                    vol_note = f" · vol ×{brk_vol:.1f} on break"
+                    if brk_vol >= 1.5:
+                        score += 8
+                    score += 25
+                    label_x, label_y = cross, vals[cross]
+                elif brk_vol < 1.2:
+                    # At bottoms heavy volume is absolutely essential.
+                    status, bias = "FORMING", "bull"
+                    trigger, invalidation = neck_last, head
+                    vol_note = (f" · breakout lacks volume "
+                                f"(×{brk_vol:.1f})")
+                    label_x, label_y = i3, head
+                else:
+                    status, bias = "BREAKOUT CONFIRMED", "bull"
+                    trigger, invalidation = vals[cross], head
+                    target = vals[cross] + height
+                    vol_note = f" · vol ×{brk_vol:.1f} on break"
+                    score += 25
+                    label_x, label_y = cross, vals[cross]
+            else:
+                # Beyond the line but no fresh cross = a stale break, not
+                # a forming pattern.
+                if direction == 1 and C[-1] < neck_last * (1 - 0.0010):
+                    continue
+                if direction == -1 and C[-1] > neck_last * (1 + 0.0010):
+                    continue
+                status = "FORMING"
+                bias = "bear" if direction == 1 else "bull"
+                trigger, invalidation = neck_last, head
+                label_x, label_y = i3, head
+            detail = (f"3 peaks · head ${head:,.2f} · neckline "
+                      f"${p2:,.2f}→${neck_last:,.2f} · RS retraced "
+                      f"{retrace:.0%} · vol "
+                      f"{_vol_str(v1)}/{_vol_str(v2)}/{_vol_str(v3)}")
+            if target is not None:
+                detail += f" · target ${target:,.2f} (min)"
+            detail += vol_note
+            cand = _make_chart_pattern(
+                name, bias, status, i1, n - 1,
+                [{"x0": i1, "y0": p1, "x1": i2, "y1": p2},
+                 {"x0": i2, "y0": p2, "x1": i3, "y1": p3},
+                 {"x0": i3, "y0": p3, "x1": i4, "y1": p4},
+                 {"x0": i4, "y0": p4, "x1": i5, "y1": p5},
+                 {"x0": i2, "y0": p2, "x1": n - 1, "y1": neck_last}],
+                label_x, label_y, trigger, invalidation, detail,
+                score, "reversal")
+            if best is None or cand["score"] > best["score"]:
+                best = cand
+    return best
+
+
+def _detect_double_top_pattern(df: pd.DataFrame) -> dict | None:
+    """Double top / Double bottom (Murphy Ch. 5, pp. 117-125), triple
+    variant folded in: two peaks at about the same level with a trough
+    between. The pattern completes ONLY when the middle trough breaks on a
+    closing basis — the second peak alone is never a pattern (the book's
+    'greatly overused' warning)."""
+    n = len(df)
+    if n < 25:
+        return None
+    H = df["High"].to_numpy()
+    L = df["Low"].to_numpy()
+    C = df["Close"].to_numpy()
+    V = df["Volume"].to_numpy()
+    pts = _alternating_swings(df)
+    if len(pts) < 3:
+        return None
+    mid = float(np.median(C))
+    best = None
+    for direction in (1, -1):
+        # direction 1: top (H L H); -1: bottom (L H L).
+        want = "HLH" if direction == 1 else "LHL"
+        for e in range(2, len(pts)):
+            seq = pts[e - 2:e + 1]
+            if "".join(p[1] for p in seq) != want:
+                continue
+            (ia, _, pa), (ib, _, pb), (ic, _, pc) = seq
+            if min(ib - ia, ic - ib) < 5 or ic - ia < 15:
+                continue
+            if ia < 5:
+                continue
+            height = abs(pa - pb)
+            if height < 0.0030 * mid:
+                continue
+            tol = max(0.0015 * mid, 0.20 * height)
+            # Peaks about the same level; a second peak slightly above the
+            # first is the book's bull-trap case, allowed only if the last
+            # close is back below the first peak.
+            if direction == 1:
+                if pa < float(L[:ia].min()) * 1.0040:
+                    continue
+                if pc > pa:
+                    if pc - pa > 0.0030 * mid or C[-1] >= pa:
+                        continue
+                elif pa - pc > tol:
+                    continue
+            else:
+                if pa > float(H[:ia].max()) * 0.9960:
+                    continue
+                if pc < pa:
+                    if pa - pc > 0.0030 * mid or C[-1] <= pa:
+                        continue
+                elif pc - pa > tol:
+                    continue
+            # Triple variant: a third peak within the same tolerance, with
+            # its own intervening trough; completion then needs BOTH
+            # troughs broken (Murphy p. 115).
+            triple = False
+            ib2, ic2, pb2, pc2 = ib, ic, pb, pc
+            if e + 2 < len(pts):
+                seq2 = pts[e + 1:e + 3]
+                if "".join(p[1] for p in seq2) == \
+                        ("LH" if direction == 1 else "HL"):
+                    (ib2, _, pb2), (ic2, _, pc2) = seq2
+                    if min(ib2 - ic, ic2 - ib2) >= 5 \
+                            and n - 1 - ic2 <= 30:
+                        ok = True
+                        if direction == 1:
+                            if pc2 > pa:
+                                if pc2 - pa > 0.0030 * mid or C[-1] >= pa:
+                                    ok = False
+                            elif pa - pc2 > tol:
+                                ok = False
+                        else:
+                            if pc2 < pa:
+                                if pa - pc2 > 0.0030 * mid or C[-1] <= pa:
+                                    ok = False
+                            elif pc2 - pa > tol:
+                                ok = False
+                        triple = ok
+            end_idx = ic2 if triple else ic
+            # Recency is judged on the pattern's actual end — the third
+            # peak for a triple, the second peak for a double.
+            if n - 1 - end_idx > 30:
+                continue
+            if direction == 1:
+                peak = max(pa, pc, pc2) if triple else max(pa, pc)
+                trig_level = min(pb, pb2) if triple else pb
+                invalid = max(pa, pc, pc2) if triple else pc
+            else:
+                peak = min(pa, pc, pc2) if triple else min(pa, pc)
+                trig_level = max(pb, pb2) if triple else pb
+                invalid = min(pa, pc, pc2) if triple else pc
+            height = abs(peak - trig_level)
+            # Volume: lighter on the second peak; heavier on the decline.
+            def _rise_vol(idx):
+                return float(V[max(0, idx - 4):idx + 1].mean())
+            va, vc = _rise_vol(ia), _rise_vol(ic)
+            score = 35.0
+            if vc < va:
+                score += 8
+            if n - 1 - ic >= 3:
+                if float(V[ic:].mean()) > vc:
+                    score += 5
+            if triple:
+                score += 5
+            score += min(end_idx - ia, 60) * 0.25 - (n - 1 - end_idx)
+            vals = np.full(n, trig_level)
+            side = -1 if direction == 1 else 1
+            cross = _line_cross(C, vals, n, side)
+            name = ("Triple Top" if triple and direction == 1 else
+                    "Triple Bottom" if triple else
+                    "Double Top" if direction == 1 else "Double Bottom")
+            target = None
+            vol_note = ""
+            if cross is not None:
+                brk_vol = _break_vol_ratio(V, ia, end_idx, cross)
+                if direction == 1:
+                    status, bias = "BREAKDOWN CONFIRMED", "bear"
+                    trigger, invalidation = trig_level, invalid
+                    target = trig_level - height
+                    vol_note = f" · vol ×{brk_vol:.1f} on break"
+                    if brk_vol >= 1.5:
+                        score += 8
+                    score += 25
+                    label_x, label_y = cross, trig_level
+                elif brk_vol < 1.2:
+                    status, bias = "FORMING", "bull"
+                    trigger, invalidation = trig_level, invalid
+                    vol_note = (f" · breakout lacks volume "
+                                f"(×{brk_vol:.1f})")
+                    label_x, label_y = ic, pc
+                else:
+                    status, bias = "BREAKOUT CONFIRMED", "bull"
+                    trigger, invalidation = trig_level, invalid
+                    target = trig_level + height
+                    vol_note = f" · vol ×{brk_vol:.1f} on break"
+                    score += 25
+                    label_x, label_y = cross, trig_level
+            else:
+                if direction == 1 and C[-1] < trig_level * (1 - 0.0010):
+                    continue
+                if direction == -1 and C[-1] > trig_level * (1 + 0.0010):
+                    continue
+                status = "FORMING"
+                bias = "bear" if direction == 1 else "bull"
+                trigger, invalidation = trig_level, invalid
+                label_x, label_y = ic, pc
+            npeaks = 3 if triple else 2
+            detail = (f"{npeaks} peaks · trough ${trig_level:,.2f} · "
+                      f"height {height / mid * 100:.2f}% · vol "
+                      f"{_vol_str(va)}/{_vol_str(vc)}")
+            if target is not None:
+                detail += f" · target ${target:,.2f} (min)"
+            detail += vol_note
+            segments = [{"x0": ia, "y0": pa, "x1": ib, "y1": pb},
+                        {"x0": ib, "y0": pb, "x1": ic, "y1": pc}]
+            if triple:
+                segments += [{"x0": ic, "y0": pc, "x1": ib2, "y1": pb2},
+                             {"x0": ib2, "y0": pb2, "x1": ic2, "y1": pc2}]
+            segments.append({"x0": ib, "y0": trig_level,
+                             "x1": n - 1, "y1": trig_level})
+            cand = _make_chart_pattern(
+                name, bias, status, ia, n - 1, segments,
+                label_x, label_y, trigger, invalidation, detail,
+                score, "reversal")
+            if best is None or cand["score"] > best["score"]:
+                best = cand
+    return best
+
+
+def _detect_broadening_pattern(df: pd.DataFrame) -> dict | None:
+    """Broadening formation / megaphone top (Murphy Ch. 6, pp. 140-141):
+    three successively higher peaks and two declining troughs, diverging
+    boundary lines, volume expanding with the swings. The only Murphy
+    pattern the triangle detector structurally excludes (it requires
+    converging lines). No measured target — the book gives none."""
+    n = len(df)
+    if n < 30:
+        return None
+    H = df["High"].to_numpy()
+    L = df["Low"].to_numpy()
+    C = df["Close"].to_numpy()
+    V = df["Volume"].to_numpy()
+    pts = _alternating_swings(df)
+    if len(pts) < 5:
+        return None
+    mid = float(np.median(C))
+    best = None
+    for e in range(4, len(pts)):
+        seq = pts[e - 4:e + 1]
+        if "".join(p[1] for p in seq) != "HLHLH":
+            continue
+        (ih1, _, h1), (il1, _, l1), (ih2, _, h2), (il2, _, l2), (ih3, _, h3) = seq
+        if ih3 - ih1 < 20 or n - 1 - ih3 > 30 or ih1 < 5:
+            continue
+        if min(il1 - ih1, ih2 - il1, il2 - ih2, ih3 - il2) < 5:
+            continue
+        if h1 < float(L[:ih1].min()) * 1.0050:
+            continue
+        if not (h2 > h1 * 1.001 and h3 > h2 * 1.001):
+            continue
+        if not (l2 < l1 * 0.999):
+            continue
+        upper = _fit_line([ih1, ih2, ih3], [h1, h2, h3])
+        lower = _fit_line([il1, il2], [l1, l2])
+        if upper is None or lower is None:
+            continue
+        if not (upper[0] > 0 and lower[0] < 0):
+            continue
+        w0 = _line_at(upper, ih1) - _line_at(lower, ih1)
+        w1 = _line_at(upper, ih3) - _line_at(lower, ih3)
+        if w0 <= 0 or w1 / w0 < 1.15:
+            continue
+        # Volume must expand with the widening swings (Murphy p. 140) —
+        # the opposite of every other triangle, and definitional here.
+        window_v = V[ih1:ih3 + 1]
+        third = max(1, len(window_v) // 3)
+        first_vol = float(window_v[:third].mean())
+        last_vol = float(window_v[-third:].mean())
+        if first_vol <= 0 or last_vol <= first_vol:
+            continue
+        vol_expand = last_vol / first_vol
+        low_vals = lower[0] * np.arange(n) + lower[1]
+        low_last = _line_at(lower, n - 1)
+        cross = _line_cross(C, low_vals, n, -1)
+        score = 35.0 + min(ih3 - ih1, 60) * 0.25 - (n - 1 - ih3)
+        if cross is not None:
+            brk_vol = _break_vol_ratio(V, ih1, ih3, cross)
+            status, bias = "BREAKDOWN CONFIRMED", "bear"
+            trigger, invalidation = low_vals[cross], h3
+            vol_note = f" · vol ×{brk_vol:.1f} on break"
+            if brk_vol >= 1.5:
+                score += 8
+            score += 25
+            label_x, label_y = cross, low_vals[cross]
+        elif C[-1] < low_last * (1 - 0.0010):
+            continue
+        else:
+            status, bias = "FORMING", "bear"
+            trigger, invalidation = l2, h3
+            vol_note = ""
+            label_x, label_y = ih3, h3
+        detail = (f"3 higher peaks / 2 lower troughs · width "
+                  f"+{(w1 / w0 - 1) * 100:.0f}% · volume expanding "
+                  f"×{vol_expand:.1f} · no measured target (Murphy)"
+                  f"{vol_note}")
+        cand = _make_chart_pattern(
+            "Broadening Formation", bias, status, ih1, n - 1,
+            [{"x0": ih1, "y0": _line_at(upper, ih1),
+              "x1": n - 1, "y1": _line_at(upper, n - 1)},
+             {"x0": ih1, "y0": _line_at(lower, ih1),
+              "x1": n - 1, "y1": _line_at(lower, n - 1)}],
+            label_x, label_y, trigger, invalidation, detail,
+            score, "reversal")
+        if best is None or cand["score"] > best["score"]:
+            best = cand
+    return best
+
+
 def detect_chart_patterns(df: pd.DataFrame) -> list[dict]:
     """Current chart-pattern recognition for the displayed session. Returns
     at most three non-duplicative patterns, confirmed breaks first."""
     found = []
     for detector in (_detect_range_pattern, _detect_triangle_pattern,
-                     _detect_flag_pattern, _detect_staircase_pattern):
+                     _detect_flag_pattern, _detect_staircase_pattern,
+                     _detect_head_shoulders_pattern,
+                     _detect_double_top_pattern,
+                     _detect_broadening_pattern):
         try:
             pattern = detector(df)
         except Exception:
@@ -967,7 +1568,11 @@ def detect_chart_patterns(df: pd.DataFrame) -> list[dict]:
     for pattern in found:
         duplicate = False
         for other in kept:
-            if pattern["family"] == other["family"] == "consolidation" \
+            # An H&S and a double top built from the same swings are the
+            # same observation (Murphy: H&S vs triple-top is "academic",
+            # p. 115) — keep the higher score, as for consolidations.
+            if pattern["family"] == other["family"] \
+                    and pattern["family"] in ("consolidation", "reversal") \
                     and overlap(pattern, other) >= 0.60:
                 duplicate = True
                 break
@@ -1425,111 +2030,6 @@ def build_pcr_gauge(pcr: float) -> go.Figure:
         yaxis=dict(visible=False, fixedrange=True),
         dragmode=False)
     return fig
-# ---------------------------------------------------------------- prominent support / resistance
-
-def nearby_sr_levels(df: pd.DataFrame, zones: list[dict],
-                     vp: dict | None = None, pa: dict | None = None,
-                     orng: dict | None = None) -> list[dict]:
-    """Show a few meaningful levels without calling every swing high support.
-
-    A swing high is potential flipped support only after a close above it.
-    A later retest that holds is needed for confirmed flipped support.
-    Confirmed swing lows require at least two spaced tests. All tests use
-    candles available at the time of this snapshot; no future candles.
-    """
-    if df.empty:
-        return []
-    price = float(df['Close'].iloc[-1])
-    close = df['Close'].to_numpy(dtype=float)
-    high = df['High'].to_numpy(dtype=float)
-    low = df['Low'].to_numpy(dtype=float)
-    n = len(df)
-    tol = max(0.08, price * 0.00025)
-    cluster_tol = max(0.15, price * 0.00075)
-    candidates = []
-
-    def add(value, source, status='Reference', priority=1):
-        if value is None or not np.isfinite(value) or value <= 0:
-            return
-        candidates.append({'price': float(value), 'source': source,
-                           'status': status, 'priority': priority})
-
-    highs, lows = swing_points(df, w=5)
-    for i in highs[-18:]:
-        level = float(high[i])
-        # Crossing must happen after the pivot has become confirmable.
-        crossings = [j for j in range(i + 6, n)
-                     if close[j] > level + tol and close[j - 1] <= level + tol]
-        if crossings:
-            first = crossings[0]
-            retests = [j for j in range(first + 1, n)
-                       if low[j] <= level + tol and close[j] >= level - tol]
-            # Retest must be followed by at least one candle holding above.
-            held = any(j + 1 < n and close[j + 1] >= level - tol
-                       for j in retests)
-            if price >= level - tol:
-                add(level, 'Former swing high',
-                    'Confirmed flipped support' if held else 'Potential flipped support',
-                    6 if held else 3)
-            else:
-                add(level, 'Former swing high', 'Broken support / resistance', 2)
-        elif level > price:
-            add(level, 'Swing high', 'Resistance reference', 2)
-
-    for i in lows[-18:]:
-        level = float(low[i])
-        tests = [j for j in lows if abs(float(low[j]) - level) <= tol]
-        spaced = any(abs(j - k) >= 5 for j in tests for k in tests)
-        if price >= level - tol:
-            add(level, 'Swing low', 'Confirmed support' if spaced else 'Potential support',
-                5 if spaced else 2)
-        else:
-            add(level, 'Swing low', 'Broken support', 1)
-
-    for z in zones:
-        level = float(z['center'])
-        status = ('Confirmed support' if level < price else 'Resistance reference')
-        add(level, f"Zone x{z['touches']}", status, 5)
-    if vp:
-        add(vp['val'], 'VAL', 'Value area reference', 2)
-        add(vp['vah'], 'VAH', 'Value area reference', 2)
-        add(vp['poc'], 'POC', 'Volume reference', 1)
-    if pa:
-        add(pa.get('PDL'), 'PDL', 'Prior-day reference', 2)
-        add(pa.get('PDH'), 'PDH', 'Prior-day reference', 2)
-    if orng:
-        add(orng.get('low'), 'OR low', 'Opening-range reference', 2)
-        add(orng.get('high'), 'OR high', 'Opening-range reference', 2)
-
-    # Cluster neighboring levels into a single band; prioritize tested levels.
-    candidates.sort(key=lambda c: c['price'])
-    groups = []
-    for c in candidates:
-        if groups and c['price'] - groups[-1][-1]['price'] <= cluster_tol:
-            groups[-1].append(c)
-        else:
-            groups.append([c])
-    merged = []
-    for group in groups:
-        best = max(group, key=lambda c: (c['priority'],
-                                         -abs(c['price'] - price)))
-        lo = min(c['price'] for c in group)
-        hi = max(c['price'] for c in group)
-        entry = dict(best)
-        entry['low'], entry['high'] = lo, hi
-        entry['price'] = best['price']
-        entry['sources'] = len(group)
-        entry['kind'] = 'Support' if hi < price else ('Resistance' if lo > price else 'At price')
-        # An untested former high must never be promoted to confirmed support.
-        merged.append(entry)
-    below = sorted((c for c in merged if c['kind'] == 'Support'),
-                   key=lambda c: -c['high'])[:2]
-    above = sorted((c for c in merged if c['kind'] == 'Resistance'),
-                   key=lambda c: c['low'])[:2]
-    at_price = [c for c in merged if c['kind'] == 'At price']
-    return below + at_price[:1] + above
-
-
 # ---------------------------------------------------------------- chart
 PHASES = [(570, 630, "Opening drive", "rgba(37, 99, 235, 0.05)"),
           (750, 780, "Midday", "rgba(107, 114, 128, 0.05)"),
@@ -1542,15 +2042,17 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
                 show: dict, window_start=None,
                 chart_patterns: list[dict] | None = None,
                 vp: dict | None = None,
-                daily_ema: dict | None = None,
-                 sr_levels: list[dict] | None = None,
-                zoom_mode: str = "Price action") -> go.Figure:
-    """Clean 2-panel chart: price with S/R and value-area references, volume."""
+                daily_ema: dict | None = None) -> go.Figure:
+    """3 panels: price (candles, EMA 9/21/50/200, VWAP, daily EMA 50/200
+    reference lines, zones, trendlines, PDH/PDC/PDL, opening range,
+    pattern markers, time-cycle phases, session volume profile), volume,
+    stochastic."""
     price = float(df["Close"].iloc[-1])
     fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True,
-        row_heights=[0.84, 0.16], vertical_spacing=0.06,
-        subplot_titles=(f"{symbol} — price action", "Volume"))
+        rows=3, cols=1, shared_xaxes=True,
+        row_heights=[0.66, 0.10, 0.24], vertical_spacing=0.05,
+        subplot_titles=(f"{symbol} — price action", "Volume",
+                        "Stochastic (momentum shift)"))
     x = df.index
     fig.add_trace(go.Candlestick(
         x=x, open=df["Open"], high=df["High"], low=df["Low"],
@@ -1558,9 +2060,9 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
         increasing_line_color="#16a34a", decreasing_line_color="#dc2626"),
         row=1, col=1)
     fig.add_trace(go.Scatter(x=x, y=df["EMA9"], name="EMA 9",
-                             line=dict(width=2.0, color="#F59E0B")), row=1, col=1)
+                             line=dict(width=1.4, color="#f59e0b")), row=1, col=1)
     fig.add_trace(go.Scatter(x=x, y=df["EMA21"], name="EMA 21",
-                             line=dict(width=2.0, color="#3B82F6")), row=1, col=1)
+                             line=dict(width=1.4, color="#2563eb")), row=1, col=1)
     if show.get("ema_long"):
         fig.add_trace(go.Scatter(x=x, y=df["EMA50"], name="EMA 50",
                                  line=dict(width=1.2, color="#db2777")),
@@ -1568,8 +2070,24 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
         fig.add_trace(go.Scatter(x=x, y=df["EMA200"], name="EMA 200",
                                  line=dict(width=1.8, color="#1f2937")),
                       row=1, col=1)
+    # Daily EMA 50/200 reference lines: flat lines from daily closes
+    # (completed sessions only) — the daily clock, not the bar-size
+    # clock. Same colours as the intraday EMA 50/200 so the colour
+    # language matches; flat + "(daily)" tells them apart. Two-point
+    # traces, so they appear in the legend with their values.
+    if show.get("daily_ema") and daily_ema:
+        for key, color, width in (("ema50", "#db2777", 2.2),
+                                  ("ema200", "#1f2937", 2.2)):
+            val = daily_ema.get(key)
+            if val is None:
+                continue
+            fig.add_trace(go.Scatter(
+                x=[x[0], x[-1]], y=[val, val],
+                name=f"EMA {key[3:]} (daily) ${val:,.2f}",
+                mode="lines", line=dict(width=width, color=color)),
+                row=1, col=1)
     fig.add_trace(go.Scatter(x=x, y=df["VWAP"], name="VWAP",
-                             line=dict(width=2.0, color="#7c3aed", dash="dash")),
+                             line=dict(width=1.2, color="#7c3aed", dash="dash")),
                   row=1, col=1)
 
     # Time-cycle phases: shaded session bands on the price panel
@@ -1638,27 +2156,6 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
                       line_width=1.2, row=1, col=1,
                       annotation_text=f"OR low {orng['low']:,.2f}",
                       annotation_position="bottom left")
-
-    # One line or band per clustered level, with status-specific labeling.
-    if show.get('sr_levels') and sr_levels:
-        for level in sr_levels:
-            is_support = level['kind'] == 'Support'
-            is_resistance = level['kind'] == 'Resistance'
-            color = '#15803d' if is_support else '#ea580c' if is_resistance else '#64748b'
-            lo, hi = level['low'], level['high']
-            status = level['status']
-            label = f"{status} {lo:,.2f}–{hi:,.2f}" if hi - lo >= 0.03 else f"{status} {level['price']:,.2f}"
-            if hi - lo >= 0.03:
-                fig.add_hrect(y0=lo, y1=hi, row=1, col=1,
-                              fillcolor='rgba(21,128,61,0.06)' if is_support else 'rgba(234,88,12,0.06)',
-                              line_width=0)
-            fig.add_hline(y=level['price'], row=1, col=1,
-                          line_color=color,
-                          line_width=2.5 if status.startswith('Confirmed') else 1.5,
-                          line_dash='solid' if status.startswith('Confirmed') else 'dash',
-                          annotation_text=label,
-                          annotation_position='bottom right' if is_support else 'top right',
-                          annotation_font=dict(size=10, color=color))
 
     # Trendlines
     if show.get("lines"):
@@ -1737,7 +2234,7 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
                 # Label at most one formation per 4 bars — in a choppy open
                 # the labels otherwise stack into an unreadable blob. The
                 # markers themselves are always drawn.
-                if labels and i - last_labeled >= 8:
+                if labels and i - last_labeled >= 4:
                     txts.append(name)
                     last_labeled = i
                 else:
@@ -1755,57 +2252,106 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
     fig.add_trace(go.Bar(x=x, y=df["Volume"], marker_color=colors,
                          name="Volume", showlegend=False), row=2, col=1)
 
+    # Stochastic
+    fig.add_trace(go.Scatter(x=x, y=df["StochK"], name="%K",
+                             line=dict(width=1.5, color="#2563eb")), row=3, col=1)
+    fig.add_trace(go.Scatter(x=x, y=df["StochD"], name="%D",
+                             line=dict(width=1.2, color="#f97316")), row=3, col=1)
+    fig.add_hline(y=80, line_dash="dot", line_color="#9ca3af", row=3, col=1,
+                  annotation_text="Overbought 80", annotation_position="top left")
+    fig.add_hline(y=20, line_dash="dot", line_color="#9ca3af", row=3, col=1,
+                  annotation_text="Oversold 20", annotation_position="bottom left")
+
     fig.update_layout(
-        height=760, margin=dict(l=10, r=20, t=55, b=10),
+        height=950, margin=dict(l=10, r=10, t=40, b=10),
         xaxis_rangeslider_visible=False, hovermode="x unified",
-        dragmode="zoom",
-        uirevision=f"{symbol}-{df.index[0].date()}-{zoom_mode}",
-        legend=dict(orientation="h", yanchor="bottom", y=1.04, x=0,
-                    font=dict(size=11)))
+        legend=dict(orientation="h", yanchor="bottom", y=1.04, x=0))
+    fig.update_yaxes(range=[0, 100], row=3, col=1)
     if window_start is not None:
         fig.update_xaxes(range=[window_start, df.index[-1]])
 
-    # Explicit price-axis ranges prevent distant historical levels and pattern
-    # annotations from compressing today's candles. Plotly's Reset axes uses
-    # this range. Pan/zoom remains enabled and uirevision preserves user zoom
-    # across live refreshes. Switching the zoom preset resets the viewport.
+    # Fit the price axis to the visible bars. The always-drawn level lines
+    # (PDH/PDC/PDL, far zones) otherwise stretch the axis on gap days and
+    # squash the candles into a sliver. A level extends the range only when
+    # it sits within one visible-range of the action (tested against the
+    # base range, so inclusions can't cascade); farther levels stay drawn
+    # but off-view until price approaches them.
     vis = df[df.index >= window_start] if window_start is not None else df
     if len(vis):
-        low = float(vis["Low"].min())
-        high = float(vis["High"].max())
-        last_px = float(vis["Close"].iloc[-1])
-        if zoom_mode == "Recent 30 minutes":
-            recent = vis[vis.index >= vis.index[-1] - pd.Timedelta(minutes=30)]
-            if len(recent):
-                low, high = float(recent["Low"].min()), float(recent["High"].max())
-        elif zoom_mode == "Recent 60 minutes":
-            recent = vis[vis.index >= vis.index[-1] - pd.Timedelta(minutes=60)]
-            if len(recent):
-                low, high = float(recent["Low"].min()), float(recent["High"].max())
-        elif zoom_mode == "Near current price":
-            width = max(last_px * 0.008, 1.5)
-            low, high = last_px - width, last_px + width
-        spread = max(high - low, last_px * 0.002)
-        padding = max(spread * 0.08, last_px * 0.001)
-        fig.update_yaxes(range=[low - padding, high + padding],
-                         autorange=False, fixedrange=False, row=1, col=1)
-    fig.update_xaxes(fixedrange=False, row=1, col=1)
+        pad = 0.004 * price
+        base_lo = float(vis["Low"].min())
+        base_hi = float(vis["High"].max())
+        ylo, yhi = base_lo - pad, base_hi + pad
+        span = base_hi - base_lo
+        cands = [z["center"] for z in drawn_zones]
+        if pa:
+            cands += [pa["PDH"], pa["PDC"], pa["PDL"]]
+        if orng:
+            cands += [orng["high"], orng["low"]]
+        # Daily EMA lines are levels too — they join `cands` and follow
+        # the same one-span rule. (The first version extended the axis
+        # to any drawn daily line, which on a narrow-range day stretched
+        # the panel to 10x the session range and squashed the candles
+        # into a sliver — the Nov 12 AAPL screenshot. Never again.)
+        if show.get("daily_ema") and daily_ema:
+            for key in ("ema50", "ema200"):
+                v = daily_ema.get(key)
+                if v is not None:
+                    cands.append(v)
+        for v in cands:
+            if base_lo - span <= v <= base_hi + span:
+                ylo = min(ylo, v - pad * 0.5)
+                yhi = max(yhi, v + pad * 0.5)
+        fig.update_yaxes(range=[ylo, yhi], row=1, col=1)
 
-    # Volume profile histogram intentionally hidden. Keep the three
-    # calculated price references, independent of histogram visibility.
-    if vp is not None and show.get("value_area", True):
-        # Distinct, consistently colored lines with readable labels.
-        for key, label, color, dash, width, position in (
-            ("vah", "VAH", "#9333ea", "dash", 2.1, "top left"),
-            ("poc", "POC", "#d97706", "solid", 2.2, "top right"),
-            ("val", "VAL", "#0891b2", "dash", 2.1, "bottom left"),
-        ):
-            fig.add_hline(
-                y=vp[key], line_dash=dash, line_color=color,
-                line_width=width, row=1, col=1,
-                annotation_text=f"{label} {vp[key]:,.2f}",
-                annotation_position=position,
-                annotation_font=dict(color=color, size=12))
+    # Session volume profile: horizontal histogram on the price panel,
+    # drawn on a secondary x-axis (x4) that overlays the right-hand
+    # fifth of the panel, so it never collides with the candles. The
+    # POC bin is amber; POC is the amber line, VAH/VAL bracket the 70%
+    # value area. x4 is used on purpose, NOT x2: in this 3-row figure
+    # with shared x-axes, x2 is already the Volume panel's axis and x3
+    # the Stochastic panel's — redefining x2 (as the first version did)
+    # hijacked the shared-x range with a volume scale and pushed the
+    # candles, EMAs, VWAP and volume bars off-screen. x4 is a fresh
+    # overlay axis with no other role.
+    # This block runs AFTER the window-range update above on purpose:
+    # update_xaxes(range=...) applies to every x-axis present, and x4's
+    # range is a volume scale, not a time scale.
+    if show.get("volume_profile") and vp is not None:
+        vols = vp["volumes"]
+        m = float(vols.max())
+        if m > 0:
+            colors = ["rgba(245, 158, 11, 0.55)"
+                      if i == vp["poc_i"] else "rgba(37, 99, 235, 0.30)"
+                      for i in range(len(vols))]
+            fig.add_trace(go.Bar(
+                y=vp["centers"], x=vols, orientation="h",
+                width=vp["bin_width"] * 0.9, marker_color=colors,
+                name="Volume profile", showlegend=True,
+                hovertemplate="Price %{y:,.2f}<br>Volume %{x:,.0f}"
+                              "<extra></extra>"),
+                row=1, col=1)
+            fig.data[-1].update(xaxis="x4")
+            fig.update_layout(
+                xaxis4=dict(overlaying="x", side="top",
+                            range=[-4 * m, m], showgrid=False,
+                            showticklabels=False, zeroline=False,
+                            fixedrange=True))
+            fig.add_hline(y=vp["poc"], line_dash="solid",
+                          line_color="#f59e0b", line_width=1.6,
+                          row=1, col=1,
+                          annotation_text=f"POC {vp['poc']:,.2f}",
+                          annotation_position="top right")
+            fig.add_hline(y=vp["vah"], line_dash="dot",
+                          line_color="#9ca3af", line_width=1.2,
+                          row=1, col=1,
+                          annotation_text=f"VAH {vp['vah']:,.2f}",
+                          annotation_position="top left")
+            fig.add_hline(y=vp["val"], line_dash="dot",
+                          line_color="#9ca3af", line_width=1.2,
+                          row=1, col=1,
+                          annotation_text=f"VAL {vp['val']:,.2f}",
+                          annotation_position="bottom left")
     return fig
 
 
@@ -1860,31 +2406,23 @@ with st.sidebar:
         # fetch bucket, so the loaders pull fresh bars.
         st.session_state["refresh_nonce"] = \
             st.session_state.get("refresh_nonce", 0) + 1
-    zoom_mode = st.selectbox(
-        "Price chart zoom",
-        ["Price action", "Recent 60 minutes", "Recent 30 minutes",
-         "Near current price"], index=0,
-        help="Controls initial/reset vertical scale. Drag on the chart to zoom; "
-             "double-click to reset. A changed preset resets the view.")
     st.header("Show")
     show = {
         "zones": st.checkbox("Support / resistance zones", value=True),
-        "sr_levels": st.checkbox("Show Support/Resistance Lines", value=True,
-                                  help="Nearest swing, zone and volume-profile reference levels with price labels."),
-        "lines": st.checkbox("Book trendlines", value=True, key="restored_trendlines"),
+        "lines": st.checkbox("Trendlines", value=True),
         "chart_patterns": st.checkbox(
             "Pattern recognition (ranges, triangles, wedges, flags, "
-            "pennants, staircases)", value=True, key="restored_patterns"),
-        "patterns": st.checkbox("Book candlestick formations", value=True, key="restored_candles"),
-        "phases": st.checkbox("Time-cycle phases", value=True, key="restored_phases"),
-        "ema_long": st.checkbox("EMA 50 / 200 (trend context)", value=False),
-        "daily_ema": False,
-        "volume_profile": False,
-        "value_area": st.checkbox("VAH / POC / VAL price lines", value=True,
-                                  help="Keep value-area reference lines without the volume-profile histogram."),
+            "pennants, staircases, head & shoulders, double tops/bottoms, "
+            "broadening formations)", value=True),
+        "patterns": st.checkbox("Candlestick formations", value=True),
+        "phases": st.checkbox("Time-cycle phases", value=True),
+        "ema_long": st.checkbox("EMA 50 / 200 (trend context)", value=True),
+        "daily_ema": st.checkbox("Daily EMA 50 / 200 reference lines",
+                                 value=True),
+        "volume_profile": st.checkbox(
+            "Volume profile (POC / value area)", value=True),
     }
-    st.caption("Colors: support green · resistance red-orange · VAH purple · POC amber · VAL cyan · EMA9 amber/yellow · EMA21 blue · VWAP dashed purple. "
-               "Formations are labeled only when they form AT a level "
+    st.caption("Formations are labeled only when they form AT a level "
                "(zone, PDH/PDC/PDL, opening-range edge) — the book's rule. "
                "Mid-chart formations appear as faint markers.")
 
@@ -1939,7 +2477,6 @@ def render():
     zones = sr_zones(disp)
     lines = trendlines(disp)
     vp = session_volume_profile(disp)
-    sr_levels = nearby_sr_levels(disp, zones, vp, pa, orng)
     chart_pats = detect_chart_patterns(disp)
     pats = candle_patterns(disp)
     level_vals = ([pa["PDH"], pa["PDC"], pa["PDL"]] if pa else []) \
@@ -1961,7 +2498,9 @@ def render():
     c2.metric("Zones on chart",
               f"{sum(1 for z in zones if z['center'] >= float(last['Close']))} selling / "
               f"{sum(1 for z in zones if z['center'] < float(last['Close']))} buying")
-    c3.metric("Session VWAP", f"${float(last['VWAP']):,.2f}")
+    c3.metric("Stochastic %K / %D",
+              f"{float(last['StochK']):.0f} / {float(last['StochD']):.0f}"
+              if pd.notna(last["StochK"]) else "—")
     wconf = weighted_confluence(
         disp, zones, level_vals, pa, orng, chart_pats,
         pcr_zone(p["pcr"])[0] if p is not None else None)
@@ -1981,7 +2520,7 @@ def render():
     daily_levels = None
     daily_ema = None
     daily_ema_skipped: list[tuple[str, float]] = []
-    if False:  # Daily EMA reference lines removed from clean chart
+    if show.get("daily_ema"):
         try:
             closes = fetch_daily_closes(
                 symbol,
@@ -2010,27 +2549,28 @@ def render():
     st.plotly_chart(build_chart(disp, symbol, zones, lines, pats, level_vals,
                                 pa, orng, show, window_start=window_start,
                                 chart_patterns=chart_pats, vp=vp,
-                                daily_ema=daily_ema, sr_levels=sr_levels,
-                                zoom_mode=zoom_mode),
+                                daily_ema=daily_ema),
                     use_container_width=True,
-                    config={"scrollZoom": True, "displayModeBar": True,
-                            "doubleClick": "reset", "responsive": True},
-                    key=f"pa_{symbol}_{tf_label}_{chart_tf.replace(' ', '_')}_{zoom_mode}")
+                    key=f"pa_{symbol}_{tf_label}_{chart_tf.replace(' ', '_')}")
 
-    if show.get('sr_levels'):
-        if sr_levels:
-            st.caption('Nearest S/R references (not guaranteed turning points): '
-                       + ' | '.join(f"{v['status']} ${v['low']:,.2f}–${v['high']:,.2f} ({v['source']})"
-                                    for v in sr_levels))
+    if show.get("volume_profile"):
+        if vp is not None:
+            st.caption(
+                f"Volume profile — session {sel_date}, {tf_label} bars, "
+                f"{vp['n_bins']} price bins: POC "
+                f"${vp['poc']:,.2f} (most volume traded here) · value area "
+                f"${vp['val']:,.2f} – ${vp['vah']:,.2f} "
+                f"({vp['va_volume'] / vp['total_volume']:.0%} of "
+                f"{vp['total_volume']:,.0f} shares). Price holding above "
+                f"the POC with the value area below it is acceptance "
+                f"higher; a close back below the POC after holding above "
+                f"it is the profile's rejection read. Display only — not "
+                f"scored in the weighted confluence.")
         else:
-            st.caption('No confirmed nearby swing or reference levels yet.')
+            st.caption("Volume profile unavailable for this session — no "
+                       "usable price range or volume.")
 
-    if show.get("value_area") and vp is not None:
-        st.caption(f"Session value area: VAH ${vp['vah']:,.2f} · "
-                   f"POC ${vp['poc']:,.2f} · VAL ${vp['val']:,.2f}. "
-                   "Levels update with session volume; they are references, not guaranteed support/resistance.")
-
-    if False:  # Daily EMA reference lines removed from clean chart
+    if show.get("daily_ema"):
         if daily_ema:
             last_px = float(last["Close"])
             parts = []
@@ -2207,7 +2747,9 @@ with st.expander("How to read this chart"):
         "sessions. Price holding above both is the wind at a long's "
         "back; below both, at a short's. Toggle them off in the sidebar "
         "(Show → EMA 50 / 200) if the chart feels crowded.\n"
-        "- **Stochastic** — not displayed on the clean chart; internal confluence calculation remains unchanged.\n"
+        "- **Stochastic (bottom)** — momentum shifts: blue %K crossing orange "
+        "%D is the event; crossing up from under 20 or down from over 80 is "
+        "the one that matters, especially right at a level.\n"
         "- **Put/Call Ratio strip** — options sentiment for the symbol "
         "(by traded volume; the open-interest PCR is shown alongside). "
         "Under 0.7 = oversold, reversal watch · 0.7–0.9 = bearish zone · "
