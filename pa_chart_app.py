@@ -3319,7 +3319,8 @@ def render_brooks():
                             info["pats"], info["level_vals"],
                             pa, orng, show_b, window_start=None,
                             chart_patterns=info["chart_pats"], vp=info["vp"],
-                            daily_ema=None),
+                            daily_ema=None,
+                            brooks_overlay={"read": read, "schw": schw}),
                 use_container_width=True, key=f"brooks_{sym}_5min")
             v = read["verdict"]
             vcolor = {"Buy": "green", "Sell": "red"}.get(v, "orange")
@@ -3372,7 +3373,7 @@ def render_brooks():
             if schw["reward_risk"]:
                 rr = schw["reward_risk"]
                 glines.append(
-                    f"- **Reward:risk {rr['ratio']:.1f}:1** — target "
+                    f"- **Reward:risk {_fmt_rr(rr['ratio'])}** — target "
                     f"${rr['target']:,.2f} ({rr['target_label']}) vs "
                     f"stop ${read['invalidation']:,.2f}"
                     + (" — below Aziz's 2:1 minimum"
@@ -3637,22 +3638,51 @@ PHASES = [(570, 630, "Opening drive", "rgba(37, 99, 235, 0.05)"),
           (900, 960, "Final hour", "rgba(249, 115, 22, 0.06)")]
 
 
+def _fmt_rr(ratio: float) -> str:
+    """Reward:risk as '0.03:1' below 1, '2.2:1' above — one decimal
+    hides the difference between 0.03:1 and 0.0:1, which is the
+    difference between a bad trade and no trade at all."""
+    return f"{ratio:.2f}:1" if ratio < 1 else f"{ratio:.1f}:1"
+
+
 def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
                 lines: list[dict], pats: dict[int, tuple[str, str]],
                 levels: list[float], pa: dict | None, orng: dict | None,
                 show: dict, window_start=None,
                 chart_patterns: list[dict] | None = None,
                 vp: dict | None = None,
-                daily_ema: dict | None = None) -> go.Figure:
+                daily_ema: dict | None = None,
+                brooks_overlay: dict | None = None) -> go.Figure:
     """3 panels: price (candles, EMA 9/21/50/200, VWAP, daily EMA 50/200
     reference lines, zones, trendlines, PDH/PDC/PDL, opening range,
     pattern markers, time-cycle phases, session volume profile), volume,
-    stochastic."""
+    stochastic. With brooks_overlay (SPY & QQQ tabs only: {"read",
+    "schw"}) the chart also carries the call — a two-line verdict
+    title, the invalidation and measured-move levels, the most recent
+    trap marker, and the strength checklist as a small block in the
+    empty corner of the price panel. The single-symbol tab passes no
+    overlay, so its chart is unchanged."""
     price = float(df["Close"].iloc[-1])
+    title = f"{symbol} — price action"
+    if brooks_overlay:
+        r = brooks_overlay.get("read") or {}
+        s = brooks_overlay.get("schw") or {}
+        v = r.get("verdict", "Hold")
+        title = (f"{symbol} — {v.upper()} {r.get('confirmation', 0)}% "
+                 f"({r.get('conviction', '')}) · {r.get('day_type', '')} · "
+                 f"Always-in {r.get('always_label', '')}")
+        if v in ("Buy", "Sell") and r.get("invalidation") is not None:
+            parts = [f"Stop ${r['invalidation']:,.2f}"]
+            rr = s.get("reward_risk")
+            if rr:
+                parts.append(f"Target ${rr['target']:,.2f}")
+                parts.append(f"R:R {_fmt_rr(rr['ratio'])}"
+                             + (" (below 2:1)" if not rr["meets"] else ""))
+            title += "<br>" + " · ".join(parts)
     fig = make_subplots(
         rows=3, cols=1, shared_xaxes=True,
         row_heights=[0.66, 0.10, 0.24], vertical_spacing=0.05,
-        subplot_titles=(f"{symbol} — price action", "Volume",
+        subplot_titles=(title, "Volume",
                         "Stochastic (momentum shift)"))
     x = df.index
     fig.add_trace(go.Candlestick(
@@ -3967,6 +3997,81 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
                           row=1, col=1,
                           annotation_text=f"VAL {vp['val']:,.2f}",
                           annotation_position="bottom left")
+
+    # Brooks overlay: the read, on the chart. The title carries the
+    # verdict; the invalidation and measured-move levels are drawn
+    # and labelled; the most recent trap gets a vertical marker; the
+    # strength checklist sits as a small block in the corner
+    # opposite the last price (bottom-right on a Buy, top-right on
+    # a Sell). Phase, pullback count, gap, consolidation, size and
+    # relative strength stay in the text panel below the chart.
+    if brooks_overlay:
+        r = brooks_overlay.get("read") or {}
+        s = brooks_overlay.get("schw") or {}
+        v = r.get("verdict")
+        inv = r.get("invalidation")
+        if inv is not None and v in ("Buy", "Sell"):
+            # Skip when it is already drawn as an opening-range edge:
+            # the OR line shows it and the title names the stop.
+            near_or = bool(orng) and (
+                abs(float(inv) - orng["high"]) < 0.05
+                or abs(float(inv) - orng["low"]) < 0.05)
+            if not near_or:
+                col = "#dc2626" if v == "Sell" else "#16a34a"
+                fig.add_hline(y=float(inv), line_dash="dash",
+                              line_color=col, line_width=1.8,
+                              row=1, col=1,
+                              annotation_text=f"Invalidation {float(inv):,.2f}",
+                              annotation_position="top left"
+                              if float(inv) > price else "bottom left")
+        for label, px in (r.get("measured_moves") or []):
+            short = str(label).replace(" measured move", "")
+            fig.add_hline(y=float(px), line_dash="dot",
+                          line_color="#6b7280", line_width=1.2,
+                          row=1, col=1,
+                          annotation_text=f"{short} ${float(px):,.2f}",
+                          annotation_position="top right"
+                          if float(px) > price else "bottom right")
+        cands = []
+        for f in (s.get("failed") or []):
+            if f.get("fail_i") is not None:
+                cands.append((int(f["fail_i"]), f["kind"],
+                              float(f["extreme"])))
+        rg = s.get("red_green")
+        if rg and rg.get("trap_i") is not None:
+            cands.append((int(rg["trap_i"]), rg["kind"],
+                          float(rg["extreme"])))
+        if cands:
+            i, kind, extreme = max(cands, key=lambda t: t[0])
+            col = "#dc2626" if kind in ("Bull trap",
+                                        "Red-to-Green trap") else "#16a34a"
+            fig.add_vline(x=x[i], line_dash="dot", line_color=col,
+                          line_width=1.5, row=1, col=1,
+                          annotation_text=f"{kind} ${extreme:,.2f}",
+                          annotation_position="top")
+        strength = r.get("strength") or []
+        if strength:
+            met = sum(1 for _, m in strength if m)
+            blines = [f"<b>Strength {met}/{len(strength)}</b>"]
+            for label, m in strength:
+                blines.append(f"{'✓' if m else '✗'} {label}")
+            # Opposite the last price, where the panel is emptiest:
+            # bottom-right on a Buy (price ended high), top-right on
+            # a Sell — and pulled in from the edge (x 0.86, not 0.99)
+            # so the prior-day level labels on the right edge stay
+            # readable. Top-left looked cleaner in theory but covered
+            # the opening spike — the day's key structure.
+            if v == "Sell":
+                bx, by, bya = 0.86, 0.98, "top"
+            else:
+                bx, by, bya = 0.86, 0.02, "bottom"
+            fig.add_annotation(xref="x domain", yref="y domain",
+                               x=bx, y=by, xanchor="right", yanchor=bya,
+                               text="<br>".join(blines), showarrow=False,
+                               align="left",
+                               bgcolor="rgba(255,255,255,0.85)",
+                               bordercolor="#9ca3af", borderwidth=1,
+                               font=dict(size=10, color="#111827"))
     return fig
 
 
