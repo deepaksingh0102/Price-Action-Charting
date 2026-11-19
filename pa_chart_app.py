@@ -37,16 +37,20 @@ book (@FORRNEERO), drawn on the chart for any US stock:
   * BROOKS — SPY & QQQ TAB (Al Brooks, "Trading Price Action Trends",
     Ch. 1-26) — SPY and QQQ in tabs, like the stock-analyzer's
     SPY/QQQ tabs, one tab per symbol on 5-minute bars with the
-    book's intraday read on each: the day type (spike and channel,
-    trend from the open, trending trading range, reversal day, trend
-    resumption, stairs, or a trading-range day), the always-in
-    direction, the spike/channel phase, the High 1 / High 2 / Low 1 /
-    Low 2 pullback count, measured-move targets (spike, channel and
-    range height — profit targets, not reversal spots), and the Ch. 19
-    strength checklist. The book's numbers are Emini-based, so the
-    tab translates them into each ETF's own average daily range and
-    bar size. The day types are read off one session; the book's
-    reliability claims do not transfer to a single day. Display only.
+    book's intraday read on each: a Buy / Sell / Hold verdict with a
+    confirmation percentage (the analyzer's High 75 / Moderate 60 /
+    Low 45 scale — confirmation counts how much of the read lines up
+    behind the direction, it is not a win probability), the day type
+    (spike and channel, trend from the open, trending trading range,
+    reversal day, trend resumption, stairs, or a trading-range day),
+    the always-in direction, the spike/channel phase, the High 1 /
+    High 2 / Low 1 / Low 2 pullback count, measured-move targets
+    (spike, channel and range height — profit targets, not reversal
+    spots), and the Ch. 19 strength checklist. The book's numbers
+    are Emini-based, so the tab translates them into each ETF's own
+    average daily range and bar size. The day types are read off one
+    session; the book's reliability claims do not transfer to a
+    single day.
   * CANDLESTICK FORMATIONS marked where they occur — highlighted ONLY when
     they form AT a level (the book's core rule: a candle mid-chart means
     nothing); mid-chart formations are drawn faint
@@ -2404,16 +2408,28 @@ def brooks_day_read(d5: pd.DataFrame, pa: dict | None,
                     sel_date, lines: list[dict] | None = None) -> dict:
     """The Brooks read for one symbol's 5-min session (Al Brooks,
     Trading Price Action Trends): day type, always-in direction,
-    spike/channel phase, High/Low leg count, measured moves, and the
-    Ch. 19 strength checklist. Display only — no score, no signal.
-    d5 is the session slice at 5-min bars with EMA9/21, VWAP and an
-    EMA20 column (computed on the warmed multi-day frame, so the
-    moving average is live from the open)."""
+    spike/channel phase, High/Low leg count, measured moves, the
+    Ch. 19 strength checklist, and a Buy / Sell / Hold verdict with a
+    confirmation percentage, like the analyzer's verdict + conviction.
+    The verdict follows the always-in direction on a trend day; a
+    range day or an unclear always-in is a Hold. Confirmation is a
+    weighted score of how much of the read lines up behind the
+    direction — strength checklist 50%, always-in votes 30%, day
+    type 20% — bucketed onto the analyzer's own scale (High 75 /
+    Moderate 60 / Low 45). It is NOT a win probability: no backtest
+    grades the Brooks verdict, and the book's reliability claims do
+    not transfer to one session. d5 is the session slice at 5-min
+    bars with EMA9/21, VWAP and an EMA20 column (computed on the
+    warmed multi-day frame, so the moving average is live from the
+    open)."""
     out = {"day_type": "Too early — not enough bars", "day_evidence": "",
            "always_in": 0, "always_label": "Unclear", "phase": "range",
            "spike": None, "legs": 0, "leg_label": "no swings yet",
            "measured_moves": [], "strength": [],
-           "or_ratio": None, "adr": None, "gap_pct": 0.0}
+           "or_ratio": None, "adr": None, "gap_pct": 0.0,
+           "verdict": "Hold", "confirmation": 45, "conviction": "Low",
+           "verdict_score": 0.0, "verdict_reason": "not enough bars yet",
+           "always_votes": (0, 0)}
     if d5 is None or len(d5) < 10:
         return out
     n = len(d5)
@@ -2491,6 +2507,7 @@ def brooks_day_read(d5: pd.DataFrame, pa: dict | None,
     else:
         always = 0
     out["always_in"] = always
+    out["always_votes"] = (bull, bear)
     out["always_label"] = "Long" if always > 0 else \
         "Short" if always < 0 else "Unclear"
 
@@ -2768,6 +2785,56 @@ def brooks_day_read(d5: pd.DataFrame, pa: dict | None,
                 f"Countertrend spikes failed ({n_failed}/{n_cs})",
                 n_failed == n_cs))
     out["strength"] = checks
+
+    # Buy / Sell / Hold with a confirmation percentage, like the
+    # analyzer's verdict + conviction. The verdict follows the
+    # always-in direction on a trend day; a range day or an unclear
+    # always-in is a Hold. Confirmation is a weighted score of how
+    # much of the read lines up behind the direction — strength
+    # checklist 50%, always-in votes 30%, day type 20% — bucketed
+    # onto the analyzer's own scale (High 75 / Moderate 60 / Low
+    # 45). It is NOT a win probability: no backtest grades the
+    # Brooks verdict, and the book's reliability claims do not
+    # transfer to one session.
+    day_w = 0.4
+    if day_type.startswith("Spike and channel") or \
+            day_type.startswith("Trend from the open"):
+        day_w = 1.0
+    elif day_type in ("Trend resumption", "Reversal day"):
+        day_w = 0.8
+    elif day_type in ("Trending trading range", "Stairs (broad channel)"):
+        day_w = 0.6
+    elif day_type == "Trend — type forming":
+        day_w = 0.5
+    met = sum(1 for _, m in checks if m)
+    chk = met / len(checks) if checks else 0.0
+    votes = max(bull, bear) / 4.0
+    score = 0.5 * chk + 0.3 * votes + 0.2 * day_w
+    if score >= 0.65:
+        conviction, confirmation = "High", 75
+    elif score >= 0.45:
+        conviction, confirmation = "Moderate", 60
+    else:
+        conviction, confirmation = "Low", 45
+    if always == 0 or day_type == "Trading range day":
+        verdict = "Hold"
+    elif always > 0:
+        verdict = "Buy"
+    else:
+        verdict = "Sell"
+    out["verdict"] = verdict
+    out["confirmation"] = confirmation
+    out["conviction"] = conviction
+    out["verdict_score"] = round(score, 2)
+    if checks:
+        out["verdict_reason"] = (
+            f"Always-in {out['always_label']} ({max(bull, bear)}/4 votes) "
+            f"+ {day_type.lower()}; {met} of {len(checks)} strength "
+            "checks met.")
+    else:
+        out["verdict_reason"] = (
+            f"Always-in {out['always_label']} ({max(bull, bear)}/4 votes) "
+            f"+ {day_type.lower()}; no trend, so no strength checklist.")
     return out
 
 
@@ -2851,8 +2918,15 @@ def render_brooks():
                             chart_patterns=chart_pats, vp=vp,
                             daily_ema=None),
                 use_container_width=True, key=f"brooks_{sym}_5min")
-            st.markdown(f"**{sym} — Brooks read: {read['day_type']}**")
+            v = read["verdict"]
+            vcolor = {"Buy": "green", "Sell": "red"}.get(v, "orange")
+            st.markdown(
+                f"**{sym} — Brooks read: :{vcolor}[{v.upper()}] — "
+                f"{read['confirmation']}% confirmation "
+                f"({read['conviction']})**")
+            st.caption(read["verdict_reason"])
             rows = [
+                f"- **Day type:** {read['day_type']}",
                 f"- **Always-in:** {read['always_label']}",
                 f"- **Phase:** {read['phase']}"
                 + (f" — spike {read['spike']['bars']} bars, "
@@ -2879,10 +2953,11 @@ def render_brooks():
                 st.markdown("\n".join(slines))
             st.caption(
                 f"{read['day_evidence']} — Brooks, Trading Price "
-                "Action Trends, on 5-min bars. The book's day types "
-                "are read off one session; its reliability claims do "
-                "not transfer to a single day. Display only — no "
-                "score, no signal.")
+                "Action Trends, on 5-min bars. Confirmation counts how "
+                "much of the read lines up behind the direction "
+                "(strength checklist, always-in votes, day type) — it "
+                "is not a win probability, and the book's reliability "
+                "claims do not transfer to a single day.")
     st.caption(
         f"Alpaca {str(_feed).upper()} · 5-min bars, full session · "
         f"SPY + QQQ · updated {datetime.now(ET).strftime('%H:%M:%S')} "
@@ -3859,10 +3934,13 @@ with st.expander("How to read this chart"):
         "the average day. The book's patterns take weeks on daily "
         "charts; the intraday VCP is a miniature of the geometry, not "
         "of the book's reliability.\n"
-        "- **Brooks tab (SPY & QQQ)** — the 5-minute read: the day type "
-        "from the opening range (under 25% of the average day range is "
-        "breakout mode; a third to a half is a trending trading range "
-        "day), the always-in direction, the spike/channel phase, the "
+        "- **Brooks tab (SPY & QQQ)** — the 5-minute read: a Buy / Sell / "
+        "Hold verdict with a confirmation percentage (High 75 / Moderate "
+        "60 / Low 45, the analyzer's scale — it counts how much of the "
+        "read lines up behind the direction, not a win probability), the "
+        "day type from the opening range (under 25% of the average day "
+        "range is breakout mode; a third to a half is a trending trading "
+        "range day), the always-in direction, the spike/channel phase, the "
         "High 1 / High 2 pullback count, and measured moves as profit "
         "targets. In a trend about 80% of reversal attempts fail and "
         "become flags — take the with-trend entries; in a range about "
