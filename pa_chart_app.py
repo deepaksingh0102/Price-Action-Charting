@@ -3658,17 +3658,25 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
     pattern markers, time-cycle phases, session volume profile), volume,
     stochastic. With brooks_overlay (SPY & QQQ tabs only: {"read",
     "schw"}) the chart also carries the call — a two-line verdict
-    title, the invalidation and measured-move levels, the most recent
-    trap marker, and the strength checklist as a small block in the
-    empty corner of the price panel. The single-symbol tab passes no
-    overlay, so its chart is unchanged."""
+    title with the direction first, the invalidation and
+    measured-move levels, and the most recent trap marker. The
+    strength checklist stays in the text panel below, not on the
+    chart (the Nov 19 C experiment put it there and it covered the
+    opening spike). The single-symbol tab passes no overlay, so its
+    chart is unchanged."""
     price = float(df["Close"].iloc[-1])
     title = f"{symbol} — price action"
     if brooks_overlay:
         r = brooks_overlay.get("read") or {}
         s = brooks_overlay.get("schw") or {}
         v = r.get("verdict", "Hold")
-        title = (f"{symbol} — {v.upper()} {r.get('confirmation', 0)}% "
+        # The direction first, in words: the verdict is the day's
+        # direction (Buy = bullish, Sell = bearish, Hold = no
+        # direction), and the title is where the eye lands first.
+        arrow, dword = {"Buy": ("▲", "BULLISH"),
+                        "Sell": ("▼", "BEARISH")}.get(v, ("■", "NEUTRAL"))
+        title = (f"{symbol} {arrow} {dword} · {v.upper()} "
+                 f"{r.get('confirmation', 0)}% "
                  f"({r.get('conviction', '')}) · {r.get('day_type', '')} · "
                  f"Always-in {r.get('always_label', '')}")
         if v in ("Buy", "Sell") and r.get("invalidation") is not None:
@@ -3999,12 +4007,16 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
                           annotation_position="bottom left")
 
     # Brooks overlay: the read, on the chart. The title carries the
-    # verdict; the invalidation and measured-move levels are drawn
-    # and labelled; the most recent trap gets a vertical marker; the
-    # strength checklist sits as a small block in the corner
-    # opposite the last price (bottom-right on a Buy, top-right on
-    # a Sell). Phase, pullback count, gap, consolidation, size and
-    # relative strength stay in the text panel below the chart.
+    # direction and the verdict; the invalidation and measured-move
+    # levels are drawn and labelled; the most recent trap gets a
+    # vertical marker with its label at the bottom of the panel (at
+    # the top it collided with the two-line title on the live
+    # screen). The strength checklist does NOT go on the chart: the
+    # C experiment (Nov 19) put it there as a block and on the live
+    # screen it covered the opening spike, then the prior-day
+    # labels. It stays in the text panel below, where it was all
+    # along. Phase, pullback count, gap, consolidation, size and
+    # relative strength stay in the text panel too.
     if brooks_overlay:
         r = brooks_overlay.get("read") or {}
         s = brooks_overlay.get("schw") or {}
@@ -4048,30 +4060,7 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
             fig.add_vline(x=x[i], line_dash="dot", line_color=col,
                           line_width=1.5, row=1, col=1,
                           annotation_text=f"{kind} ${extreme:,.2f}",
-                          annotation_position="top")
-        strength = r.get("strength") or []
-        if strength:
-            met = sum(1 for _, m in strength if m)
-            blines = [f"<b>Strength {met}/{len(strength)}</b>"]
-            for label, m in strength:
-                blines.append(f"{'✓' if m else '✗'} {label}")
-            # Opposite the last price, where the panel is emptiest:
-            # bottom-right on a Buy (price ended high), top-right on
-            # a Sell — and pulled in from the edge (x 0.86, not 0.99)
-            # so the prior-day level labels on the right edge stay
-            # readable. Top-left looked cleaner in theory but covered
-            # the opening spike — the day's key structure.
-            if v == "Sell":
-                bx, by, bya = 0.86, 0.98, "top"
-            else:
-                bx, by, bya = 0.86, 0.02, "bottom"
-            fig.add_annotation(xref="x domain", yref="y domain",
-                               x=bx, y=by, xanchor="right", yanchor=bya,
-                               text="<br>".join(blines), showarrow=False,
-                               align="left",
-                               bgcolor="rgba(255,255,255,0.85)",
-                               bordercolor="#9ca3af", borderwidth=1,
-                               font=dict(size=10, color="#111827"))
+                          annotation_position="bottom")
     return fig
 
 
