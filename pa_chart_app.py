@@ -35,7 +35,8 @@ book (@FORRNEERO), drawn on the chart for any US stock:
     Template is daily context only — it never changes the weighted
     confluence score.
   * BROOKS — SPY & QQQ TAB (Al Brooks, "Trading Price Action Trends",
-    Ch. 1-26) — a side-by-side 5-minute view of SPY and QQQ with the
+    Ch. 1-26) — SPY and QQQ in tabs, like the stock-analyzer's
+    SPY/QQQ tabs, one tab per symbol on 5-minute bars with the
     book's intraday read on each: the day type (spike and channel,
     trend from the open, trending trading range, reversal day, trend
     resumption, stairs, or a trading-range day), the always-in
@@ -2809,17 +2810,18 @@ def _brooks_symbol_data(sym: str):
 
 
 def render_brooks():
-    """SPY & QQQ side by side on 5-minute bars, each with the full
-    chart (zones, trendlines, patterns, volume profile) and the Brooks
-    read underneath: day type, always-in, spike/channel phase, High/Low
+    """SPY & QQQ in tabs, like the stock-analyzer's SPY/QQQ tabs — one
+    tab per symbol on 5-minute bars, each with the full chart (zones,
+    trendlines, patterns, volume profile) and the Brooks read
+    underneath: day type, always-in, spike/channel phase, High/Low
     leg count, measured moves, strength checklist. No PCR, no weighted
     confluence, no Trend Template here — those live on the
     single-symbol tab."""
     show_b = dict(show)
     show_b["daily_ema"] = False
-    cols = st.columns(2)
-    for col, sym in zip(cols, BROOKS_SYMBOLS):
-        with col:
+    tabs = st.tabs([f"{sym} — Brooks" for sym in BROOKS_SYMBOLS])
+    for tab, sym in zip(tabs, BROOKS_SYMBOLS):
+        with tab:
             data, err = _brooks_symbol_data(sym)
             if err:
                 st.info(err)
