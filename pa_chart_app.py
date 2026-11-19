@@ -2903,7 +2903,9 @@ def brooks_day_read(d5: pd.DataFrame, pa: dict | None,
 
 def schwager_day_reads(d5: pd.DataFrame, pa: dict | None,
                        orng: dict | None, read: dict,
-                       chart_pats: list[dict] | None) -> dict:
+                       chart_pats: list[dict] | None,
+                       candle_pats: dict[int, tuple[str, str]] | None = None,
+                       levels: list[float] | None = None) -> dict:
     """Schwager, Getting Started in Technical Analysis, Part Four —
     the codable pieces for the Brooks tab. Failed breakouts (Ch. 17
     rules 56/57/58/62/76): an opening-range breakout (from
@@ -2920,9 +2922,23 @@ def schwager_day_reads(d5: pd.DataFrame, pa: dict | None,
     the panel only shows lines that exist. Pattern-level failures
     are deliberately not re-derived here: the range and opening-range
     breakouts are the book's cases, and the pattern detectors only
-    carry their current status."""
+    carry their current status.
+
+    Andrew Aziz, How to Day Trade for a Living: reward:risk of the
+    nearest measured-move target against the invalidation price
+    (his Rule 5: minimum 2:1); the Red-to-Green trap — a push through
+    the prior close that closes back (short the failure, stop above
+    the green extreme; mirror for the long); break of the prior
+    day's high / low; and the reversal setup — an indecision candle
+    (hammer, shooting star, doji) at a level after >= 5 consecutive
+    same-direction closes. The reversal setup is UNGRADED: the Nov 18
+    grade showed a single 1-min shooting star is weak, and the run
+    condition has not been graded on his 60-day QQQ file — it is a
+    label, not a signal."""
     out = {"failed": [], "failed_lean": 0, "wide_reversal": None,
-           "gap": None, "consol": None, "size": None}
+           "gap": None, "consol": None, "size": None,
+           "reward_risk": None, "red_green": None, "hod_lod": [],
+           "reversal_setup": None}
     if d5 is None or len(d5) < 10 or not read:
         return out
     n = len(d5)
@@ -3037,6 +3053,131 @@ def schwager_day_reads(d5: pd.DataFrame, pa: dict | None,
                 label = "mid-range — no lean"
             out["consol"] = {"position": round(pos, 2), "label": label}
 
+    # Aziz (Rule 5: minimum 2:1 reward:risk): the nearest measured
+    # move in the verdict direction, divided by the distance to the
+    # invalidation price. Uses only numbers the panel already
+    # computes. A trend day's stop (the opening-range edge) is
+    # usually far from the close, so this often reads below 2:1 —
+    # that is the point: it says when the trade is not worth the
+    # risk, even with a Buy/Sell verdict.
+    inv = read.get("invalidation")
+    if read.get("verdict") in ("Buy", "Sell") and inv is not None:
+        risk = abs(last_close - float(inv))
+        mms = read.get("measured_moves") or []
+        if risk > 0 and mms:
+            if read["verdict"] == "Buy":
+                above = [(lb, px) for lb, px in mms if px > last_close]
+                tgt = min(above, key=lambda t: t[1]) if above else None
+                ratio = (tgt[1] - last_close) / risk if tgt else None
+            else:
+                below = [(lb, px) for lb, px in mms if px < last_close]
+                tgt = max(below, key=lambda t: t[1]) if below else None
+                ratio = (last_close - tgt[1]) / risk if tgt else None
+            if tgt is not None and ratio is not None:
+                out["reward_risk"] = {"target": float(tgt[1]),
+                                      "target_label": tgt[0],
+                                      "ratio": float(ratio),
+                                      "meets": ratio >= 2.0}
+
+    # Aziz, Red-to-Green (short) and its mirror: the stock traded on
+    # one side of the prior close, pushed through it, then closed
+    # back — a failed breakout at the PDC line, the same family as
+    # the trap flag above. The most recent crossing wins, and it is
+    # only live if the last close is still on the trap side. The stop
+    # is the extreme reached while on the wrong side.
+    if pdc:
+        rg = None
+        for j in range(1, n):
+            if float(c[j]) < pdc <= float(c[j - 1]):
+                green_start = j - 1
+                while green_start > 0 \
+                        and float(c[green_start - 1]) > pdc:
+                    green_start -= 1
+                earlier_red = any(float(c[i]) < pdc
+                                  for i in range(green_start))
+                if earlier_red and float(c[-1]) < pdc:
+                    rg = {"kind": "Red-to-Green trap",
+                          "direction": "short",
+                          "extreme": float(h[green_start:j].max()),
+                          "time": _time(j), "trap_i": j}
+            elif float(c[j]) > pdc >= float(c[j - 1]):
+                red_start = j - 1
+                while red_start > 0 \
+                        and float(c[red_start - 1]) < pdc:
+                    red_start -= 1
+                earlier_green = any(float(c[i]) > pdc
+                                    for i in range(red_start))
+                if earlier_green and float(c[-1]) > pdc:
+                    rg = {"kind": "Green-to-Red trap",
+                          "direction": "long",
+                          "extreme": float(l[red_start:j].min()),
+                          "time": _time(j), "trap_i": j}
+        out["red_green"] = rg
+
+    # Aziz, Break of High / Low of Day: the first 5-min close above
+    # the prior day's high, or below the prior day's low. (His
+    # morning-high version is the opening-range breakout, already in
+    # the Brooks read — this is the prior-day level, the one the app
+    # draws but never flags.)
+    if pa and pa.get("PDH") and pa.get("PDL"):
+        events = []
+        for i in range(n):
+            if float(c[i]) > pa["PDH"]:
+                events.append({"kind": "High of day",
+                               "time": _time(i),
+                               "price": float(c[i]),
+                               "level": float(pa["PDH"]),
+                               "bar_i": i})
+                break
+        for i in range(n):
+            if float(c[i]) < pa["PDL"]:
+                events.append({"kind": "Low of day",
+                               "time": _time(i),
+                               "price": float(c[i]),
+                               "level": float(pa["PDL"]),
+                               "bar_i": i})
+                break
+        events.sort(key=lambda e: e["bar_i"])
+        out["hod_lod"] = events
+
+    # Aziz, Reversal setup: an indecision candle (hammer, shooting
+    # star, doji) AT A LEVEL, after >= 5 consecutive same-direction
+    # closes — his scanner's condition (7 straight candles in the
+    # book's example). The plain candle labels on the chart are
+    # untouched; this only names the setup in the panel, most recent
+    # first. UNGRADED — a label, not a signal.
+    if candle_pats and levels:
+        for i in sorted(candle_pats, reverse=True):
+            name, _bias = candle_pats[i]
+            if name not in ("Hammer", "Shooting star", "Doji"):
+                continue
+            if not at_level(float(l[i]), float(h[i]), levels):
+                continue
+            run = 0
+            direction = None
+            if name == "Hammer" or (name == "Doji"):
+                j = i - 1
+                while j >= 1 and float(c[j]) < float(c[j - 1]):
+                    run += 1
+                    j -= 1
+                if run >= 5:
+                    direction = "down"
+            if direction is None and (name == "Shooting star"
+                                      or name == "Doji"):
+                run = 0
+                j = i - 1
+                while j >= 1 and float(c[j]) > float(c[j - 1]):
+                    run += 1
+                    j -= 1
+                if run >= 5:
+                    direction = "up"
+            if direction is not None:
+                out["reversal_setup"] = {
+                    "name": name, "time": _time(i),
+                    "price": float(c[i]), "run": run,
+                    "direction": direction}
+                break
+
     # Position size from the verdict's invalidation price (Ch. 16
     # step 3; Ch. 18 rule 9): 1% of a $100k account, display-only.
     # The daily swing run's 0.5% rule is a different system and is
@@ -3112,12 +3253,14 @@ def render_brooks():
     trendlines, patterns, volume profile) and the Brooks read
     underneath: day type, always-in, spike/channel phase, High/Low
     leg count, measured moves, strength checklist, plus the Schwager
-    Part Four section (verdict invalidation, position size, failed
-    breakouts, wide-range reversal bar, gap status, consolidation
-    position, SPY vs QQQ relative strength). No PCR, no weighted
-    confluence, no Trend Template here — those live on the
-    single-symbol tab. Both symbols are gathered first so each panel
-    can quote the other's day change (Schwager rule 71)."""
+    Part Four and Aziz sections (verdict invalidation, position size,
+    reward:risk, failed breakouts, Red-to-Green trap, wide-range
+    reversal bar, gap status, consolidation position, break of the
+    prior day's high/low, reversal setup, SPY vs QQQ relative
+    strength). No PCR, no weighted confluence, no Trend Template
+    here — those live on the single-symbol tab. Both symbols are
+    gathered first so each panel can quote the other's day change
+    (Schwager rule 71)."""
     show_b = dict(show)
     show_b["daily_ema"] = False
     per_sym = {}
@@ -3139,7 +3282,9 @@ def render_brooks():
             + ([orng["high"], orng["low"]] if orng else [])
         read = brooks_day_read(disp, pa, data["daily"], orng,
                                data["sel_date"], lines=lines)
-        schw = schwager_day_reads(disp, pa, orng, read, chart_pats)
+        schw = schwager_day_reads(disp, pa, orng, read, chart_pats,
+                                  candle_pats=pats,
+                                  levels=level_vals)
         last = disp.iloc[-1]
         prev_close = pa["PDC"] if pa else float(disp["Close"].iloc[0])
         chg = (float(last["Close"]) / prev_close - 1) * 100 \
@@ -3224,6 +3369,14 @@ def render_brooks():
                     f"${s['stop']:,.2f}, risk "
                     f"${s['risk_per_share']:.2f}/share → {s['shares']} "
                     "shares at 1% of $100k.")
+            if schw["reward_risk"]:
+                rr = schw["reward_risk"]
+                glines.append(
+                    f"- **Reward:risk {rr['ratio']:.1f}:1** — target "
+                    f"${rr['target']:,.2f} ({rr['target_label']}) vs "
+                    f"stop ${read['invalidation']:,.2f}"
+                    + (" — below Aziz's 2:1 minimum"
+                       if not rr["meets"] else ""))
             for fb in schw["failed"][:1]:
                 lean = "bearish" if fb["kind"] == "Bull trap" \
                     else "bullish"
@@ -3238,6 +3391,24 @@ def render_brooks():
                     f"{fb['time']}; lean flips {lean}, stop "
                     f"{'above' if fb['kind'] == 'Bull trap' else 'below'} "
                     f"${fb['extreme']:,.2f}{conflict}.")
+            if schw["red_green"]:
+                rg = schw["red_green"]
+                conflict = ""
+                if (rg["direction"] == "short" and v == "Buy") or \
+                        (rg["direction"] == "long" and v == "Sell"):
+                    conflict = f" — conflicts with the {v} verdict"
+                if rg["direction"] == "short":
+                    glines.append(
+                        f"- **{rg['kind']}:** rallied above the prior "
+                        f"close to ${rg['extreme']:,.2f}, closed back "
+                        f"below at {rg['time']}; lean flips bearish, "
+                        f"stop above ${rg['extreme']:,.2f}{conflict}.")
+                else:
+                    glines.append(
+                        f"- **{rg['kind']}:** dipped below the prior "
+                        f"close to ${rg['extreme']:,.2f}, closed back "
+                        f"above at {rg['time']}; lean flips bullish, "
+                        f"stop below ${rg['extreme']:,.2f}{conflict}.")
             if schw["wide_reversal"]:
                 wr = schw["wide_reversal"]
                 glines.append(
@@ -3250,17 +3421,35 @@ def render_brooks():
                 glines.append(
                     f"- **Gap:** {g['pct']:+.1f}% open — "
                     f"{'filled at ' + g['fill_time'] if g['filled'] else 'still open'}.")
+            for e in schw["hod_lod"]:
+                if e["kind"] == "High of day":
+                    glines.append(
+                        f"- **Break of high of day:** closed above the "
+                        f"prior day's high (${e['level']:,.2f}) at "
+                        f"{e['time']}.")
+                else:
+                    glines.append(
+                        f"- **Break of low of day:** closed below the "
+                        f"prior day's low (${e['level']:,.2f}) at "
+                        f"{e['time']}.")
             if schw["consol"]:
                 glines.append(
                     f"- **Consolidation:** the range sits "
                     f"{schw['consol']['label']} (Rule 49).")
+            if schw["reversal_setup"]:
+                rs = schw["reversal_setup"]
+                glines.append(
+                    f"- **Reversal setup:** {rs['name']} at "
+                    f"${rs['price']:,.2f} after a {rs['run']}-bar "
+                    f"{rs['direction']} run (Aziz — ungraded, not a "
+                    "signal).")
             rel = _schwager_rel_line(sym, chg, peer, peer_chg)
             if rel:
                 glines.append(f"- **vs {peer}:** {rel} (Rule 71).")
             if glines:
                 st.markdown(
-                    "**Schwager — Getting Started in Technical "
-                    "Analysis, Part Four**\n" + "\n".join(glines))
+                    "**Schwager & Aziz — day-trading adds**\n"
+                    + "\n".join(glines))
             st.caption(
                 f"{read['day_evidence']} — Brooks, Trading Price "
                 "Action Trends, on 5-min bars. Confirmation counts how "
