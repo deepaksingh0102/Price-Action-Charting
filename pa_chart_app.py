@@ -34,6 +34,18 @@ book (@FORRNEERO), drawn on the chart for any US stock:
     and the book's reliability claims do not transfer to it. The
     Template is daily context only — it never changes the weighted
     confluence score.
+  * BROOKS — SPY & QQQ TAB (Al Brooks, "Trading Price Action Trends",
+    Ch. 1-26) — a side-by-side 5-minute view of SPY and QQQ with the
+    book's intraday read on each: the day type (spike and channel,
+    trend from the open, trending trading range, reversal day, trend
+    resumption, stairs, or a trading-range day), the always-in
+    direction, the spike/channel phase, the High 1 / High 2 / Low 1 /
+    Low 2 pullback count, measured-move targets (spike, channel and
+    range height — profit targets, not reversal spots), and the Ch. 19
+    strength checklist. The book's numbers are Emini-based, so the
+    tab translates them into each ETF's own average daily range and
+    bar size. The day types are read off one session; the book's
+    reliability claims do not transfer to a single day. Display only.
   * CANDLESTICK FORMATIONS marked where they occur — highlighted ONLY when
     they form AT a level (the book's core rule: a candle mid-chart means
     nothing); mid-chart formations are drawn faint
@@ -2192,6 +2204,689 @@ def weighted_confluence(df: pd.DataFrame, zones: list[dict],
             "notes": notes}
 
 
+# ---------------------------------------------------------------- Brooks — SPY & QQQ tab
+BROOKS_VIEW = "SPY & QQQ — Brooks (5-min)"
+BROOKS_SYMBOLS = ("SPY", "QQQ")
+BROOKS_BAR_MIN = 5
+BROOKS_ADR_DAYS = 20  # sessions for the average daily range
+
+
+def _brooks_median_range(df: pd.DataFrame) -> float:
+    r = (df["High"] - df["Low"]).to_numpy(dtype=float)
+    r = r[np.isfinite(r) & (r > 0)]
+    return float(np.median(r)) if len(r) else 0.0
+
+
+def _brooks_spike(d5: pd.DataFrame,
+                  pdc: float | None) -> dict | None:
+    """Opening spike (Brooks Ch. 21): a run of >= 3 same-direction trend
+    bars (body >= 40% of the bar, each close extending beyond the prior
+    close) starting in the first hour, or a single exceptionally large
+    first bar, or a gap open (>= 0.4%) plus a strong first bar in the
+    gap direction. A spike is a breakout, a climax and a gap at once —
+    it is where a trend begins. Returns None when no such run exists."""
+    if d5 is None or len(d5) < 3:
+        return None
+    med = _brooks_median_range(d5)
+    if med <= 0:
+        return None
+    o = d5["Open"].to_numpy(dtype=float)
+    h = d5["High"].to_numpy(dtype=float)
+    l = d5["Low"].to_numpy(dtype=float)
+    c = d5["Close"].to_numpy(dtype=float)
+    n = len(d5)
+
+    def _run(start: int, direction: int) -> int:
+        run = 0
+        for i in range(start, n):
+            body = abs(c[i] - o[i])
+            rng = h[i] - l[i]
+            if i == start:
+                extends = True if start == 0 else (
+                    c[i] > c[i - 1] if direction > 0
+                    else c[i] < c[i - 1])
+            elif direction > 0:
+                extends = c[i] > c[i - 1]
+            else:
+                extends = c[i] < c[i - 1]
+            if body >= 0.4 * rng and extends:
+                run += 1
+            else:
+                break
+        return run
+
+    gap_pct = (float(o[0]) / pdc - 1) * 100 if pdc else 0.0
+
+    def _height(start: int, direction: int, run: int):
+        """Spike height: from the run's open — or from the prior close
+        when the spike starts on a gap open (Brooks: a gap opening is
+        itself a spike, Ch. 21)."""
+        end = start + run - 1
+        gap_up = start == 0 and abs(gap_pct) >= 0.4 and gap_pct > 0
+        gap_dn = start == 0 and abs(gap_pct) >= 0.4 and gap_pct < 0
+        if direction > 0:
+            extreme = float(h[start:end + 1].max())
+            base = pdc if gap_up else float(o[start])
+            return extreme, extreme - base
+        extreme = float(l[start:end + 1].min())
+        base = pdc if gap_dn else float(o[start])
+        return extreme, base - extreme
+
+    best = None
+    for start in range(0, min(12, n - 2)):
+        for direction in (1, -1):
+            run = _run(start, direction)
+            if run < 3:
+                continue
+            _, height = _height(start, direction, run)
+            # A spike must MOVE — a slow drift of trend bars is not one
+            # (Brooks: a spike is steep). 0.30% of price is the floor.
+            if height < 0.003 * float(o[start]):
+                continue
+            if best is None or start < best[0]:
+                best = (start, direction, run)
+    if best is None:
+        # A single exceptionally large first bar (or a gap + strong bar)
+        # also counts as a spike (Brooks: a spike can be one trend bar).
+        if (h[0] - l[0]) >= 2.5 * med:
+            direction = 1 if c[0] > o[0] else -1 if c[0] < o[0] else 0
+            if direction:
+                _, height = _height(0, direction, 1)
+                if height >= 0.003 * float(o[0]):
+                    best = (0, direction, 1)
+        if best is None and abs(gap_pct) >= 0.4:
+            direction = 1 if gap_pct > 0 else -1
+            first_strong = (abs(c[0] - o[0]) >= 0.4 * (h[0] - l[0])
+                            and ((c[0] > o[0]) == (direction > 0)))
+            if first_strong:
+                _, height = _height(0, direction, 1)
+                if height >= 0.003 * float(o[0]):
+                    best = (0, direction, 1)
+    if best is None:
+        return None
+    start, direction, run = best
+    end = start + run - 1
+    extreme, height = _height(start, direction, run)
+    return {"direction": direction, "start": int(start), "bars": int(run),
+            "end": int(end), "extreme": extreme, "height": float(height),
+            "gap_pct": float(gap_pct)}
+
+
+def _brooks_legs(d5: pd.DataFrame, direction: int) -> tuple[int, str]:
+    """Pullback legs since the session trend extreme began, counted from
+    the alternating swing sequence (w=3) — Brooks' High 1 / High 2 /
+    Low 1 / Low 2 (Ch. 10, 18). Returns (legs, setup label). The count
+    is the number of completed pullback legs; a break above the prior
+    bar's high after leg N is a High N setup."""
+    if d5 is None or len(d5) < 5:
+        return 0, "no swings yet"
+    swings = _alternating_swings(d5)
+    if not swings:
+        return 0, "no swings yet"
+    c = d5["Close"].to_numpy(dtype=float)
+    n = len(d5)
+    prev_high = float(d5["High"].iloc[-2]) if n > 1 \
+        else float(d5["High"].iloc[-1])
+    prev_low = float(d5["Low"].iloc[-2]) if n > 1 \
+        else float(d5["Low"].iloc[-1])
+    if direction > 0:
+        hs = [s for s in swings if s[1] == "H"]
+        if not hs:
+            return 0, "no pullback yet — spike phase"
+        # Each swing low after the first swing high ends one pullback
+        # leg (the first high is where the trend's first leg ends).
+        first_h = hs[0][0]
+        legs = sum(1 for s in swings if s[1] == "L" and s[0] > first_h)
+        if legs == 0:
+            return 0, "no pullback yet — spike phase"
+        if c[-1] > prev_high:
+            tag = f"High {min(legs, 3)}"
+            if legs >= 3:
+                tag += " (wedge flag)"
+            return legs, f"{tag} — pullback break, buy setup"
+        if swings[-1][1] == "L":
+            done = max(legs - 1, 0)
+            return legs, (f"in pullback — leg {done + 1} forming, "
+                          f"watch for High {min(done + 1, 3)}")
+        return legs, f"{legs} pullback leg(s) done — no break yet"
+    ls = [s for s in swings if s[1] == "L"]
+    if not ls:
+        return 0, "no pullback yet — spike phase"
+    first_l = ls[0][0]
+    legs = sum(1 for s in swings if s[1] == "H" and s[0] > first_l)
+    if legs == 0:
+        return 0, "no pullback yet — spike phase"
+    if c[-1] < prev_low:
+        tag = f"Low {min(legs, 3)}"
+        if legs >= 3:
+            tag += " (wedge flag)"
+        return legs, f"{tag} — pullback break, sell setup"
+    if swings[-1][1] == "H":
+        done = max(legs - 1, 0)
+        return legs, (f"in pullback — leg {done + 1} forming, "
+                      f"watch for Low {min(done + 1, 3)}")
+    return legs, f"{legs} pullback leg(s) done — no break yet"
+
+
+def _brooks_counter_spikes(d5: pd.DataFrame, direction: int) -> tuple[int, int]:
+    """Countertrend spikes (a bar whose BODY is >= 1.5x the median body,
+    in the opposite direction) and how many of them failed — the next
+    bar closed back in the trend direction (Ch. 19: reversal spikes
+    with no follow-through become flags). Body, not bar range: a spike
+    is a big-bodied bar."""
+    if d5 is None or len(d5) < 3 or not direction:
+        return 0, 0
+    o = d5["Open"].to_numpy(dtype=float)
+    c = d5["Close"].to_numpy(dtype=float)
+    bodies = np.abs(c - o)
+    med_body = float(np.median(bodies)) if len(bodies) else 0.0
+    if med_body <= 0:
+        return 0, 0
+    total = failed = 0
+    for i in range(len(d5) - 1):
+        if bodies[i] < 1.5 * med_body:
+            continue
+        counter = (direction > 0 and c[i] < o[i]) or \
+            (direction < 0 and c[i] > o[i])
+        if not counter:
+            continue
+        total += 1
+        back = (direction > 0 and c[i + 1] > c[i]) or \
+            (direction < 0 and c[i + 1] < c[i])
+        if back:
+            failed += 1
+    return total, failed
+
+
+def brooks_day_read(d5: pd.DataFrame, pa: dict | None,
+                    daily: pd.DataFrame | None, orng: dict | None,
+                    sel_date, lines: list[dict] | None = None) -> dict:
+    """The Brooks read for one symbol's 5-min session (Al Brooks,
+    Trading Price Action Trends): day type, always-in direction,
+    spike/channel phase, High/Low leg count, measured moves, and the
+    Ch. 19 strength checklist. Display only — no score, no signal.
+    d5 is the session slice at 5-min bars with EMA9/21, VWAP and an
+    EMA20 column (computed on the warmed multi-day frame, so the
+    moving average is live from the open)."""
+    out = {"day_type": "Too early — not enough bars", "day_evidence": "",
+           "always_in": 0, "always_label": "Unclear", "phase": "range",
+           "spike": None, "legs": 0, "leg_label": "no swings yet",
+           "measured_moves": [], "strength": [],
+           "or_ratio": None, "adr": None, "gap_pct": 0.0}
+    if d5 is None or len(d5) < 10:
+        return out
+    n = len(d5)
+    med = _brooks_median_range(d5)
+    pdc = pa["PDC"] if pa else None
+    o = d5["Open"].to_numpy(dtype=float)
+    h = d5["High"].to_numpy(dtype=float)
+    l = d5["Low"].to_numpy(dtype=float)
+    c = d5["Close"].to_numpy(dtype=float)
+
+    # Average daily range from the prior sessions (the book's yardstick
+    # for opening-range size and pullback size).
+    adr = None
+    if daily is not None and not daily.empty:
+        try:
+            prior = daily[[d < sel_date for d in daily.index]]
+            if len(prior) >= 10:
+                adr = float((prior["High"] - prior["Low"]).tail(
+                    BROOKS_ADR_DAYS).mean())
+        except Exception:
+            adr = None
+    out["adr"] = adr
+    or_ratio = None
+    if orng and adr:
+        or_ratio = (orng["high"] - orng["low"]) / adr
+    out["or_ratio"] = or_ratio
+    gap_pct = (float(o[0]) / pdc - 1) * 100 if pdc else 0.0
+    out["gap_pct"] = gap_pct
+
+    spike = _brooks_spike(d5, pdc)
+    out["spike"] = spike
+
+    # Always-in: the direction of the most recent 5-min signal — price
+    # vs VWAP, EMA 9 vs 21, trending swings, and the last close above
+    # the prior bar's high (bull) or below its low (bear). 3 of 4 with
+    # no conflict, else unclear.
+    last = d5.iloc[-1]
+    bull = bear = 0
+    if pd.notna(last.get("VWAP")):
+        if float(last["Close"]) > float(last["VWAP"]):
+            bull += 1
+        else:
+            bear += 1
+    if pd.notna(last.get("EMA9")) and pd.notna(last.get("EMA21")):
+        # A hair's-width gap is noise, not a signal — the pair needs
+        # to be 0.01% of price apart before it counts as a vote.
+        gap = float(last["EMA9"]) - float(last["EMA21"])
+        if gap > 0.0001 * float(last["Close"]):
+            bull += 1
+        elif gap < -0.0001 * float(last["Close"]):
+            bear += 1
+    swings = _alternating_swings(d5)
+    hs = [s for s in swings if s[1] == "H"]
+    ls = [s for s in swings if s[1] == "L"]
+    # Swing trend: the last two swing highs (or lows) trending — either
+    # pair counts, but only if the other pair does not contradict it
+    # (a range day has rising lows and falling highs at once).
+    h_up = len(hs) >= 2 and hs[-1][2] > hs[-2][2]
+    h_dn = len(hs) >= 2 and hs[-1][2] < hs[-2][2]
+    l_up = len(ls) >= 2 and ls[-1][2] > ls[-2][2]
+    l_dn = len(ls) >= 2 and ls[-1][2] < ls[-2][2]
+    if (h_up or l_up) and not (h_dn or l_dn):
+        bull += 1
+    elif (h_dn or l_dn) and not (h_up or l_up):
+        bear += 1
+    if n > 1:
+        if float(last["Close"]) > float(d5["High"].iloc[-2]):
+            bull += 1
+        elif float(last["Close"]) < float(d5["Low"].iloc[-2]):
+            bear += 1
+    if bull >= 3 and bull > bear:
+        always = 1
+    elif bear >= 3 and bear > bull:
+        always = -1
+    else:
+        always = 0
+    out["always_in"] = always
+    out["always_label"] = "Long" if always > 0 else \
+        "Short" if always < 0 else "Unclear"
+
+    # Phase: spike, channel, or range.
+    if lines is None:
+        lines = trendlines(d5)
+    if spike and n <= spike["end"] + 2:
+        phase = "spike"
+    elif spike:
+        pulled_back = float(l[spike["end"]:].min()) <= spike["extreme"] - 0.5 * med \
+            if spike["direction"] > 0 else \
+            float(h[spike["end"]:].max()) >= spike["extreme"] + 0.5 * med
+        phase = "channel" if (pulled_back or lines) else "spike"
+    elif always != 0 and lines:
+        phase = "channel"
+    else:
+        phase = "range"
+    out["phase"] = phase
+
+    # Pullback legs (High 1 / High 2 / Low 1 / Low 2).
+    leg_dir = always if always != 0 else (
+        spike["direction"] if spike else 0)
+    if leg_dir:
+        legs, leg_label = _brooks_legs(d5, leg_dir)
+    else:
+        legs, leg_label = 0, "no trend — no leg count"
+    out["legs"] = legs
+    out["leg_label"] = leg_label
+
+    # Largest pullback from the running extreme, as a share of ADR.
+    max_pb = None
+    if adr:
+        if always >= 0:
+            run_max = np.maximum.accumulate(h)
+            max_pb = float(np.max(run_max - l)) / adr
+        else:
+            run_min = np.minimum.accumulate(l)
+            max_pb = float(np.max(h - run_min)) / adr
+
+    # Morning direction (first-hour close vs open) — the reversal test
+    # compares the always-in now against the morning.
+    morning_dir = 0
+    if n > 11:
+        if float(c[11]) > float(o[0]):
+            morning_dir = 1
+        elif float(c[11]) < float(o[0]):
+            morning_dir = -1
+
+    # Opening-range breakout bar and the second range after it.
+    brk_i = None
+    brk_dir = 0
+    if orng:
+        for i in range(n):
+            if float(c[i]) > orng["high"]:
+                brk_i, brk_dir = i, 1
+                break
+            if float(c[i]) < orng["low"]:
+                brk_i, brk_dir = i, -1
+                break
+    second_range = False
+    if brk_i is not None and adr:
+        for j in range(brk_i + 1, n - 4):
+            seg = d5.iloc[j:j + 5]
+            if float(seg["High"].max() - seg["Low"].min()) < 0.5 * adr:
+                second_range = True
+                break
+
+    # Midday tight range (>= 12 bars, range < 30% of ADR) + a late
+    # breakout in the morning direction — the trend-resumption shape.
+    # The first hour must have been a real trend (>= 50% of the avg
+    # day range), not a drift, and the late breakout must clear the
+    # band by >= 10% of ADR — otherwise any range day with a tight
+    # stretch and a higher close would qualify.
+    tight = None
+    first_hour_move = None
+    if adr and n > 11:
+        first_hour_move = abs(float(c[11]) - float(o[0])) / adr
+        for j in range(12, n - 11):
+            seg = d5.iloc[j:j + 12]
+            if float(seg["High"].max() - seg["Low"].min()) < 0.30 * adr:
+                tight = (j, j + 11)
+                break
+    late_brk = False
+    if tight and morning_dir and first_hour_move is not None \
+            and first_hour_move >= 0.50:
+        t0, t1 = tight
+        after = d5.iloc[t1 + 1:]
+        band_hi = float(d5.iloc[t0:t1 + 1]["High"].max())
+        band_lo = float(d5.iloc[t0:t1 + 1]["Low"].min())
+        if morning_dir > 0 and len(after) \
+                and float(after["Close"].max()) > band_hi + 0.10 * adr:
+            late_brk = True
+        elif morning_dir < 0 and len(after) \
+                and float(after["Close"].min()) < band_lo - 0.10 * adr:
+            late_brk = True
+
+    # Stairs: >= 3 swings each way with >= 2 overlaps — a pullback
+    # retracing beyond the prior breakout point. The swings must NET
+    # trend in the always-in direction and span at least half the avg
+    # day range: a range day's oscillations overlap by construction
+    # but do not trend, and a narrow channel is not stairs.
+    stairs = False
+    if len(hs) >= 3 and len(ls) >= 3 and always != 0 and adr:
+        if always > 0:
+            trending = hs[-1][2] > hs[0][2] and ls[-1][2] > ls[0][2]
+        else:
+            trending = hs[-1][2] < hs[0][2] and ls[-1][2] < ls[0][2]
+        span = (max(s[2] for s in hs) - min(s[2] for s in ls)) / adr
+        if trending and span >= 0.50:
+            overlaps = 0
+            for k in range(1, len(hs)):
+                hi_next = hs[k + 1][0] if k + 1 < len(hs) else n
+                following = [s for s in ls if hs[k][0] < s[0] < hi_next]
+                if following and min(s[2] for s in following) < hs[k][2]:
+                    overlaps += 1
+            for k in range(1, len(ls)):
+                lo_next = ls[k + 1][0] if k + 1 < len(ls) else n
+                following = [s for s in hs if ls[k][0] < s[0] < lo_next]
+                if following and max(s[2] for s in following) > ls[k][2]:
+                    overlaps += 1
+            stairs = overlaps >= 2
+
+    # Day type, in the book's order of recognition.
+    day_type = None
+    evidence = ""
+    if always != 0 and morning_dir != 0 and always != morning_dir:
+        # A pullback that begins with a strong countertrend spike can
+        # grow into a trend channel the other way (Ch. 24). A spike
+        # here is a bar with a body >= 2x the median body.
+        med_body = float(np.median(np.abs(c - o))) if n else 0.0
+        counter = False
+        for i in range(12, n):
+            if med_body <= 0 or abs(c[i] - o[i]) < 2.0 * med_body:
+                continue
+            if always > 0 and c[i] > o[i]:
+                counter = True
+                break
+            if always < 0 and c[i] < o[i]:
+                counter = True
+                break
+        if counter:
+            day_type = "Reversal day"
+            evidence = ("morning trend flipped — always-in is now "
+                        f"{out['always_label'].lower()} after a strong "
+                        "countertrend spike (Ch. 24)")
+    if day_type is None and spike and always != 0:
+        # The day's extreme formed in the first few bars (Ch. 23).
+        if always > 0:
+            extreme_early = float(l[:5].min()) == float(l.min())
+        else:
+            extreme_early = float(h[:5].max()) == float(h.max())
+        if extreme_early and max_pb is not None and max_pb < 0.30:
+            day_type = "Trend from the open" + (
+                " — small pullback" if max_pb < 0.20 else "")
+            evidence = (f"extreme formed in the first 5 bars, largest "
+                        f"pullback {max_pb:.0%} of the avg day range "
+                        "(Ch. 23)")
+    if day_type is None and spike and phase == "channel":
+        day_type = "Spike and channel"
+        evidence = (f"spike of {spike['bars']} bars "
+                    f"(${spike['height']:.2f}) then a channel phase "
+                    "(Ch. 21)")
+    if day_type is None and or_ratio is not None \
+            and 0.30 <= or_ratio <= 0.55 and brk_i is not None \
+            and second_range:
+        day_type = "Trending trading range"
+        evidence = (f"opening range {or_ratio:.0%} of the avg day range, "
+                    "broke out, then a second range formed (Ch. 22)")
+    if day_type is None and morning_dir != 0 and tight and late_brk:
+        day_type = "Trend resumption"
+        evidence = ("strong first hour, tight midday range, then the "
+                    "trend resumed late in the day (Ch. 25)")
+    if day_type is None and stairs:
+        day_type = "Stairs (broad channel)"
+        evidence = ("3+ trending swings with overlapping pullbacks "
+                    "(Ch. 26)")
+    if day_type is None and always == 0 and not spike:
+        day_type = "Trading range day"
+        evidence = ("no trend-line break, no trending swings, no spike "
+                    "— trade both directions (Part IV intro)")
+    if day_type is None and always != 0:
+        day_type = "Trend — type forming"
+        evidence = (f"always-in {out['always_label'].lower()}, day type "
+                    "not yet decided by the opening-range / spike rules")
+    if day_type is None:
+        day_type = "Range — forming"
+        evidence = "no trend yet — watching the first hour"
+    out["day_type"] = day_type
+    out["day_evidence"] = evidence
+
+    # Measured moves — profit targets, not reversal spots (Ch. 21).
+    mms = []
+    if spike:
+        if spike["direction"] > 0:
+            pb_low = float(l[spike["end"]:].min())
+            mms.append(("Spike measured move",
+                        pb_low + spike["height"]))
+        else:
+            pb_high = float(h[spike["end"]:].max())
+            mms.append(("Spike measured move",
+                        pb_high - spike["height"]))
+    res = next((x for x in lines if x["kind"] == "resistance"), None)
+    sup = next((x for x in lines if x["kind"] == "support"), None)
+    if res and sup:
+        height = abs(float(res["y1"]) - float(sup["y1"]))
+        if always >= 0:
+            mms.append(("Channel measured move",
+                        float(sup["y1"]) + height))
+        else:
+            mms.append(("Channel measured move",
+                        float(res["y1"]) - height))
+    if orng and brk_dir != 0:
+        or_h = orng["high"] - orng["low"]
+        if brk_dir > 0:
+            mms.append(("Range measured move", orng["high"] + or_h))
+        else:
+            mms.append(("Range measured move", orng["low"] - or_h))
+    out["measured_moves"] = mms
+
+    # Strength checklist (Ch. 19) — only where a trend direction exists.
+    checks = []
+    trend_dir = always if always != 0 else (
+        spike["direction"] if spike else 0)
+    if trend_dir:
+        checks.append((
+            f"Gap open {gap_pct:+.1f}% in the trend direction",
+            abs(gap_pct) >= 0.3 and (gap_pct > 0) == (trend_dir > 0)))
+        bodies = np.abs(c - o)
+        ranges = h - l
+        trend_bars = ((bodies >= 0.5 * np.where(ranges > 0, ranges, 1))
+                      & (((c > o) & (trend_dir > 0))
+                         | ((c < o) & (trend_dir < 0)))).mean()
+        checks.append((
+            f"Most bars trend bars in the trend direction "
+            f"({trend_bars:.0%})", trend_bars >= 0.5))
+        overlaps = []
+        for i in range(1, n):
+            lo1, hi1 = min(o[i - 1], c[i - 1]), max(o[i - 1], c[i - 1])
+            lo2, hi2 = min(o[i], c[i]), max(o[i], c[i])
+            inter = max(0.0, min(hi1, hi2) - max(lo1, lo2))
+            smaller = min(hi1 - lo1, hi2 - lo2)
+            if smaller > 0:
+                overlaps.append(inter / smaller)
+        if overlaps:
+            checks.append((
+                "Little body overlap between consecutive bars "
+                f"(median {float(np.median(overlaps)):.0%})",
+                float(np.median(overlaps)) < 0.30))
+        if "EMA20" in d5.columns:
+            e20 = d5["EMA20"].to_numpy(dtype=float)
+            touches = [i for i in range(n)
+                       if l[i] <= e20[i] <= h[i]
+                       and np.isfinite(e20[i])]
+            last_touch = touches[-1] if touches else -1
+            ma_gap = n - 1 - last_touch
+            checks.append((
+                f"{ma_gap} bars since the last touch of the 20-bar MA",
+                ma_gap >= 20))
+            if n >= 2 and np.isfinite(e20[-1]) \
+                    and np.isfinite(e20[-2]):
+                wrong = sum(
+                    1 for j in (-1, -2)
+                    if (trend_dir > 0 and c[j] < e20[j])
+                    or (trend_dir < 0 and c[j] > e20[j]))
+                checks.append((
+                    "No 2 consecutive closes on the wrong side of "
+                    "the MA", wrong < 2))
+        if max_pb is not None:
+            checks.append((
+                f"Largest pullback {max_pb:.0%} of the avg day range",
+                max_pb < 0.30))
+        n_cs, n_failed = _brooks_counter_spikes(d5, trend_dir)
+        if n_cs:
+            checks.append((
+                f"Countertrend spikes failed ({n_failed}/{n_cs})",
+                n_failed == n_cs))
+    out["strength"] = checks
+    return out
+
+
+def _brooks_symbol_data(sym: str):
+    """1-min bars -> warmed 5-min frame for one Brooks symbol, plus
+    prior-day levels, opening range and daily bars. Returns
+    (data dict, error string)."""
+    try:
+        df1 = fetch_bars_1m(
+            sym, _bucket(live, int(refresh_secs)),
+            end=view_date.isoformat() if past_mode else "")
+    except Exception as e:
+        return None, f"Could not load bars for {sym}: {e}"
+    if df1.empty or len(df1) < 60:
+        return None, f"Not enough intraday data for {sym} yet."
+    dates = sorted(set(df1.index.date))
+    if past_mode and view_date not in dates:
+        return None, (f"No trading session for {sym} on {view_date} — "
+                      f"the market was closed that day, or the symbol "
+                      f"did not trade.")
+    sel = view_date if past_mode else dates[-1]
+    full5 = add_indicators(resample(df1, BROOKS_BAR_MIN))
+    full5["EMA20"] = ema(full5["Close"], 20)
+    disp = full5[full5.index.normalize() == pd.Timestamp(sel, tz=ET)]
+    if len(disp) < 10:
+        return None, (f"Only the first few bars of the {sym} session "
+                      "so far — the read builds as bars arrive.")
+    pa = prior_day_levels(df1)
+    today_df = df1[df1.index.date == sel]
+    orng = opening_range(today_df)
+    daily = None
+    try:
+        daily = fetch_daily_bars(
+            sym, _bucket(live, int(refresh_secs), bucket_secs=86400),
+            end=view_date.isoformat() if past_mode else "")
+    except Exception:
+        daily = None
+    return {"symbol": sym, "sel_date": sel, "disp": disp, "pa": pa,
+            "orng": orng, "daily": daily}, None
+
+
+def render_brooks():
+    """SPY & QQQ side by side on 5-minute bars, each with the full
+    chart (zones, trendlines, patterns, volume profile) and the Brooks
+    read underneath: day type, always-in, spike/channel phase, High/Low
+    leg count, measured moves, strength checklist. No PCR, no weighted
+    confluence, no Trend Template here — those live on the
+    single-symbol tab."""
+    show_b = dict(show)
+    show_b["daily_ema"] = False
+    cols = st.columns(2)
+    for col, sym in zip(cols, BROOKS_SYMBOLS):
+        with col:
+            data, err = _brooks_symbol_data(sym)
+            if err:
+                st.info(err)
+                continue
+            disp = data["disp"]
+            pa = data["pa"]
+            orng = data["orng"]
+            zones = sr_zones(disp)
+            lines = trendlines(disp)
+            vp = session_volume_profile(disp)
+            chart_pats = detect_chart_patterns(disp)
+            pats = candle_patterns(disp)
+            level_vals = ([pa["PDH"], pa["PDC"], pa["PDL"]] if pa else []) \
+                + [z["center"] for z in zones] \
+                + ([orng["high"], orng["low"]] if orng else [])
+            read = brooks_day_read(disp, pa, data["daily"], orng,
+                                   data["sel_date"], lines=lines)
+            last = disp.iloc[-1]
+            prev_close = pa["PDC"] if pa else float(disp["Close"].iloc[0])
+            chg = (float(last["Close"]) / prev_close - 1) * 100 \
+                if prev_close else 0.0
+            st.metric(sym, f"${float(last['Close']):,.2f}",
+                      f"{chg:+.2f}% vs prior close")
+            st.plotly_chart(
+                build_chart(disp, sym, zones, lines, pats, level_vals,
+                            pa, orng, show_b, window_start=None,
+                            chart_patterns=chart_pats, vp=vp,
+                            daily_ema=None),
+                use_container_width=True, key=f"brooks_{sym}_5min")
+            st.markdown(f"**{sym} — Brooks read: {read['day_type']}**")
+            rows = [
+                f"- **Always-in:** {read['always_label']}",
+                f"- **Phase:** {read['phase']}"
+                + (f" — spike {read['spike']['bars']} bars, "
+                   f"${read['spike']['height']:.2f} from the open"
+                   if read["spike"] else ""),
+                f"- **Pullback count:** {read['leg_label']}",
+            ]
+            if read["measured_moves"]:
+                rows.append("- **Measured moves:** " + " · ".join(
+                    f"{label} ${px:,.2f}"
+                    for label, px in read["measured_moves"]))
+            if read["or_ratio"] is not None:
+                rows.append(
+                    f"- **Opening range:** {read['or_ratio']:.0%} of the "
+                    f"{BROOKS_ADR_DAYS}-day avg day range "
+                    f"(${read['adr']:,.2f})")
+            st.markdown("\n".join(rows))
+            if read["strength"]:
+                met = sum(1 for _, m in read["strength"] if m)
+                slines = [f"**Strength checklist (Ch. 19) — "
+                          f"{met}/{len(read['strength'])}**"]
+                for label, m in read["strength"]:
+                    slines.append(f"- {'✓' if m else '✗'} {label}")
+                st.markdown("\n".join(slines))
+            st.caption(
+                f"{read['day_evidence']} — Brooks, Trading Price "
+                "Action Trends, on 5-min bars. The book's day types "
+                "are read off one session; its reliability claims do "
+                "not transfer to a single day. Display only — no "
+                "score, no signal.")
+    st.caption(
+        f"Alpaca {str(_feed).upper()} · 5-min bars, full session · "
+        f"SPY + QQQ · updated {datetime.now(ET).strftime('%H:%M:%S')} "
+        f"ET · build {BUILD_TAG} · {BUILD_HASH}")
+
+
 # ---------------------------------------------------------------- PCR
 # Zone bands exactly as the user specified (the sideways band is 0.9-1.1,
 # centered on PCR = 1):
@@ -2713,6 +3408,13 @@ if not _key or not _secret:
     st.stop()
 
 with st.sidebar:
+    view = st.radio(
+        "View",
+        ["Single symbol", BROOKS_VIEW],
+        index=0,
+        help="Single symbol is the full charting app for one ticker. "
+             "SPY & QQQ — Brooks shows both indexes side by side on "
+             "5-minute bars with the Brooks day read on each.")
     st.header("Chart")
     symbol = st.text_input("Stock symbol", value="AAPL").strip().upper() or "AAPL"
     _today_et = datetime.now(ET).date()
@@ -3101,19 +3803,21 @@ def render():
         f"build {BUILD_TAG} · {BUILD_HASH}")
 
 
+# The dispatch runs one view: the Brooks tab or the single-symbol chart.
+_show = render_brooks if view == BROOKS_VIEW else render
 if past_mode:
-    render()
+    _show()
     st.caption(f"Viewing the {view_date} session — live tracking is "
                f"paused in date view. Set the Session date back to "
                f"today for the live chart.")
 elif live and in_market_hours():
-    st.fragment(run_every=int(refresh_secs))(render)()
+    st.fragment(run_every=int(refresh_secs))(_show)()
 elif live:
-    render()
+    _show()
     st.caption("Live tracking is on, but the market is closed — showing the "
                "last session without auto-refresh.")
 else:
-    render()
+    _show()
     st.caption("Live tracking is off — this is a one-time snapshot. "
                "Turn on **Live tracking** in the sidebar for auto-refresh, "
                "or use 🔄 Refresh now.")
@@ -3153,6 +3857,14 @@ with st.expander("How to read this chart"):
         "the average day. The book's patterns take weeks on daily "
         "charts; the intraday VCP is a miniature of the geometry, not "
         "of the book's reliability.\n"
+        "- **Brooks tab (SPY & QQQ)** — the 5-minute read: the day type "
+        "from the opening range (under 25% of the average day range is "
+        "breakout mode; a third to a half is a trending trading range "
+        "day), the always-in direction, the spike/channel phase, the "
+        "High 1 / High 2 pullback count, and measured moves as profit "
+        "targets. In a trend about 80% of reversal attempts fail and "
+        "become flags — take the with-trend entries; in a range about "
+        "80% of breakouts fail — fade the extremes.\n"
         "- **Triangles / diamonds on the candles** — candlestick formations. "
         "Labeled ones formed **at a level** (that's when the book says they "
         "count); faint unlabeled ones formed mid-chart and are shown for "
