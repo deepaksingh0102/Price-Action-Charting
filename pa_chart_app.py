@@ -54,11 +54,8 @@ book (@FORRNEERO), drawn on the chart for any US stock:
   * CANDLESTICK FORMATIONS marked where they occur — highlighted ONLY when
     they form AT a level (the book's core rule: a candle mid-chart means
     nothing); mid-chart formations are drawn faint
-  * MOVING AVERAGES — EMA 9 / 21 (the book's crossover pair), EMA 50 / 200
-    trend-context lines on the chosen bar size (sidebar toggle), + session
-    VWAP. DAILY EMA 50 / 200 flat reference lines (sidebar toggle) —
-    computed from daily closes through the prior completed session, so
-    the daily clock reads on the intraday chart. Display only.
+  * MOVING AVERAGES — EMA 9 / 21 (the book's crossover pair) + session
+    VWAP. Display only.
   * Prior-day levels (the book's AHPMB levels): PDH / PDC / PDL, and the
     30-minute opening range
   * SESSION VOLUME PROFILE — the day's volume by price level (24 bins
@@ -118,16 +115,12 @@ def _build_hash() -> str:
 
 BUILD_HASH = _build_hash()
 LOAD_DAYS = 7            # calendar days of 1-min bars (covers ~5 sessions)
-DAILY_EMA_DAYS = 300     # calendar days of daily bars for the daily-EMA
-                         # reference lines (~208 sessions — enough to warm
-                         # a 200-day EMA); the 1-min frame is far too short
-DAILY_TEMPLATE_DAYS = 400  # calendar days of daily OHLCV for the Minervini
-                         # Trend Template: 252 sessions for the 52-week
-                         # high/low, plus SMA200 warm-up and the 1-month
-                         # slope lookback
-DAILY_EMA_MAX_DIST = 0.15  # a daily-EMA line more than 15% from the last
-                           # price is hidden (it would stretch the price
-                           # panel); its value is still named in the caption
+DAILY_CONTEXT_DAYS = 60  # calendar days of daily bars (~40 sessions) for
+                         # the intraday-only daily context that remains:
+                         # the Brooks 20-session average daily range and
+                         # the pattern volume pace (20-session average
+                         # daily volume). The 1-min frame is far too short
+                         # for either.
 ZONE_TOL = 0.0015        # 0.15% — prices within this band are "the same level"
 LEVEL_TOL = 0.0020       # 0.20% — a bar is "at" a level within this band
 
@@ -135,8 +128,7 @@ LEVEL_TOL = 0.0020       # 0.20% — a bar is "at" a level within this band
 # (None = full session since market open) — same control as the
 # stock-analyzer's. It sets the visible window, not the bar size; zones,
 # trendlines and formations are computed on the full session.
-CHART_TF_TRAILING = {"5 minutes": 5, "15 minutes": 15, "1 hour": 60,
-                     "2 hours": 120, "3 hours": 180, "4 hours": 240,
+CHART_TF_TRAILING = {"5 minutes": 5, "15 minutes": 15,
                      "Since market open": None}
 
 
@@ -236,11 +228,11 @@ def fetch_bars_1m(symbol: str, bucket: int = 0,
 
 @st.cache_data(show_spinner=False)
 def fetch_daily_bars(symbol: str, bucket: int = 0,
-                     days: int = DAILY_TEMPLATE_DAYS,
+                     days: int = DAILY_CONTEXT_DAYS,
                      end: str = "") -> pd.DataFrame:
     """Daily OHLCV bars — one cheap 1Day-bars pull. The 1-min frame only
-    covers LOAD_DAYS (~5 sessions), far too short for a 200-day average
-    or a 52-week high/low, so this is a separate fetch. `end` anchors the
+    covers LOAD_DAYS (~5 sessions), far too short for a 20-session
+    average, so this is a separate fetch. `end` anchors the
     window to a past session for the date view, mirroring fetch_bars_1m.
     The index is the trading date (the UTC calendar date of each daily
     bar) — that matches the session date in either of Alpaca's daily-bar
@@ -284,132 +276,6 @@ def fetch_daily_bars(symbol: str, bucket: int = 0,
     return df.sort_index()
 
 
-@st.cache_data(show_spinner=False)
-def fetch_daily_closes(symbol: str, bucket: int = 0,
-                       days: int = DAILY_EMA_DAYS,
-                       end: str = "") -> pd.Series:
-    """Daily closes for the daily-EMA reference lines — the Close column
-    of fetch_daily_bars. Kept as its own function so the EMA path is
-    unchanged (same window, same values)."""
-    bars = fetch_daily_bars(symbol, bucket, days, end)
-    if bars.empty:
-        return pd.Series(dtype=float)
-    return bars["Close"]
-
-
-def daily_ema_levels(closes: pd.Series, session_date) -> dict | None:
-    """Daily EMA 50 / 200 as of the last COMPLETED session before
-    `session_date` — the session's own close is not known while it is
-    trading (and in date view it is the day being replayed), so it is
-    excluded: no lookahead. An EMA draws only when enough closes warmed
-    it (EMA 50 needs >= 50 closes, EMA 200 needs >= 200); None when
-    neither qualifies."""
-    if closes is None or len(closes) < 2:
-        return None
-    prior = closes[[d < session_date for d in closes.index]]
-    n = len(prior)
-    if n < 2:
-        return None
-    out = {"asof": prior.index[-1], "n": n, "ema50": None, "ema200": None}
-    if n >= 50:
-        out["ema50"] = float(ema(prior, 50).iloc[-1])
-    if n >= 200:
-        out["ema200"] = float(ema(prior, 200).iloc[-1])
-    if out["ema50"] is None and out["ema200"] is None:
-        return None
-    return out
-
-
-def trend_template(daily: pd.DataFrame, session_date) -> dict | None:
-    """Minervini's Trend Template (Ch. 5, p. 79) + four-stage label, from
-    daily OHLCV through the last COMPLETED session before `session_date`
-    — no lookahead. Simple moving averages per the book (NOT the app's
-    daily EMA lines — EMA and SMA disagree near crosses, and the book's
-    numbers are SMA). Needs >= 252 sessions (52-week high/low + SMA200
-    warm-up + the 1-month slope lookback); None when the history is too
-    short. Criterion 8 (IBD RS ranking >= 70) is vendor data the app
-    cannot compute — it is reported as n/a, never approximated. The
-    checklist is daily context only; it never changes the weighted
-    confluence score."""
-    if daily is None or daily.empty or len(daily) < 252:
-        return None
-    prior = daily[[d < session_date for d in daily.index]]
-    n = len(prior)
-    if n < 252:
-        return None
-    C = prior["Close"].astype(float)
-    H = prior["High"].astype(float)
-    L = prior["Low"].astype(float)
-    V = prior["Volume"].astype(float)
-    O = prior["Open"].astype(float)
-    sma = lambda k: float(C.rolling(k).mean().iloc[-1])
-    sma50, sma150, sma200 = sma(50), sma(150), sma(200)
-    sma200_s = C.rolling(200).mean()
-    sma200_21 = float(sma200_s.iloc[-22])
-    sma200_84 = float(sma200_s.iloc[-85])
-    c0 = float(C.iloc[-1])
-    high52 = float(H.tail(252).max())
-    low52 = float(L.tail(252).min())
-    criteria = [
-        {"label": f"Price ${c0:,.2f} above SMA150 ${sma150:,.2f} and "
-                  f"SMA200 ${sma200:,.2f}",
-         "met": bool(c0 > sma150 and c0 > sma200)},
-        {"label": f"SMA150 ${sma150:,.2f} above SMA200 ${sma200:,.2f}",
-         "met": bool(sma150 > sma200)},
-        {"label": f"SMA200 rising >= 1 month "
-                  f"(${sma200_21:,.2f} -> ${sma200:,.2f}; 4-5 mo: "
-                  f"${sma200_84:,.2f} -> ${sma200:,.2f})",
-         "met": bool(sma200 > sma200_21)},
-        {"label": f"SMA50 ${sma50:,.2f} above SMA150 and SMA200",
-         "met": bool(sma50 > sma150 and sma50 > sma200)},
-        {"label": f"Price ${c0:,.2f} above SMA50 ${sma50:,.2f}",
-         "met": bool(c0 > sma50)},
-        {"label": f"Price >= 30% above 52-week low ${low52:,.2f} "
-                  f"({(c0 / low52 - 1) * 100:.0f}% above)",
-         "met": bool(c0 >= 1.30 * low52)},
-        {"label": f"Price within 25% of 52-week high ${high52:,.2f} "
-                  f"({(1 - c0 / high52) * 100:.0f}% below)",
-         "met": bool(c0 >= 0.75 * high52)},
-        {"label": "RS ranking >= 70 — n/a (IBD data not available)",
-         "met": None},
-    ]
-    met = sum(1 for c in criteria[:7] if c["met"])
-
-    # Stage label (Weinstein's four stages, Minervini Ch. 5, pp. 63-78).
-    # Stage 2: Template trend criteria met + daily higher highs/lows
-    # stair-stepping + more volume on up days than down days (last 20).
-    # Stage 4: below a falling 200-day and near the 52-week low. Stage 1:
-    # below a FLAT 200-day (slope < 0.10% over a month — adaptation;
-    # "flat" is qualitative in the book). Stage 3: above the 200-day but
-    # the 200-day rolling over, or a major one-day break in the last 20
-    # sessions (decline > 3% — adaptation of "largest one-day decline",
-    # p. 73). Anything else: no label rather than a forced one.
-    slope21 = sma200 - sma200_21
-    slope_prev21 = sma200_21 - float(sma200_s.iloc[-43])
-    hi_idx, lo_idx = swing_points(prior, w=5)
-    hh_up = len(hi_idx) >= 2 and float(H.iloc[hi_idx[-1]]) > float(
-        H.iloc[hi_idx[-2]])
-    ll_up = len(lo_idx) >= 2 and float(L.iloc[lo_idx[-1]]) > float(
-        L.iloc[lo_idx[-2]])
-    last20 = prior.tail(20)
-    up_vol = float(V.tail(20)[C.tail(20) > O.tail(20)].sum())
-    dn_vol = float(V.tail(20)[C.tail(20) < O.tail(20)].sum())
-    worst_day = float((C.tail(20) / C.tail(20).shift(1) - 1).min())
-    if (all(c["met"] for c in criteria[:5]) and hh_up and ll_up
-            and up_vol > dn_vol):
-        stage = "Stage 2 (advancing)"
-    elif c0 < sma200 and slope21 < 0 and c0 <= 1.10 * low52:
-        stage = "Stage 4 (declining)"
-    elif c0 < sma200 and abs(slope21) / sma200 < 0.001:
-        stage = "Stage 1 (basing)"
-    elif c0 > sma200 and ((slope21 < 0 < slope_prev21)
-                          or worst_day < -0.03):
-        stage = "Stage 3 (topping)"
-    else:
-        stage = "Stage unclear — no label"
-    return {"asof": prior.index[-1], "n": n, "criteria": criteria,
-            "met": met, "stage": stage, "sma50": sma50, "sma150": sma150,
-            "sma200": sma200, "high52": high52, "low52": low52}
 
 
 def _volume_pace(disp: pd.DataFrame,
@@ -449,16 +315,13 @@ def stoch_kd(high: pd.Series, low: pd.Series, close: pd.Series,
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """EMA 9/21/50/200, session-anchored VWAP, stochastic — computed on
+    """EMA 9/21, session-anchored VWAP, stochastic — computed on
     the frame as given (for 1-min frames the VWAP is the exact session
     VWAP; on resampled frames it is the standard resampled
-    approximation). The EMAs run across the whole loaded frame, so the
-    50/200 arrive at today's open already warmed by the prior sessions."""
+    approximation)."""
     df = df.copy()
     df["EMA9"] = ema(df["Close"], 9)
     df["EMA21"] = ema(df["Close"], 21)
-    df["EMA50"] = ema(df["Close"], 50)
-    df["EMA200"] = ema(df["Close"], 200)
     dates = df.index.date
     df["_d"] = dates
     tp = (df["High"] + df["Low"] + df["Close"]) / 3.0
@@ -3257,12 +3120,11 @@ def render_brooks():
     reward:risk, failed breakouts, Red-to-Green trap, wide-range
     reversal bar, gap status, consolidation position, break of the
     prior day's high/low, reversal setup, SPY vs QQQ relative
-    strength). No PCR, no weighted confluence, no Trend Template
+    strength). No PCR, no weighted confluence
     here — those live on the single-symbol tab. Both symbols are
     gathered first so each panel can quote the other's day change
     (Schwager rule 71)."""
     show_b = dict(show)
-    show_b["daily_ema"] = False
     per_sym = {}
     for sym in BROOKS_SYMBOLS:
         data, err = _brooks_symbol_data(sym)
@@ -3319,7 +3181,6 @@ def render_brooks():
                             info["pats"], info["level_vals"],
                             pa, orng, show_b, window_start=None,
                             chart_patterns=info["chart_pats"], vp=info["vp"],
-                            daily_ema=None,
                             brooks_overlay={"read": read, "schw": schw}),
                 use_container_width=True, key=f"brooks_{sym}_5min")
             v = read["verdict"]
@@ -3651,12 +3512,10 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
                 show: dict, window_start=None,
                 chart_patterns: list[dict] | None = None,
                 vp: dict | None = None,
-                daily_ema: dict | None = None,
                 brooks_overlay: dict | None = None) -> go.Figure:
-    """3 panels: price (candles, EMA 9/21/50/200, VWAP, daily EMA 50/200
-    reference lines, zones, trendlines, PDH/PDC/PDL, opening range,
-    pattern markers, time-cycle phases, session volume profile), volume,
-    stochastic. With brooks_overlay (SPY & QQQ tabs only: {"read",
+    """3 panels: price (candles, EMA 9/21, VWAP, zones, trendlines,
+    PDH/PDC/PDL, opening range, pattern markers, time-cycle phases,
+    session volume profile), volume, stochastic. With brooks_overlay (SPY & QQQ tabs only: {"read",
     "schw"}) the chart also carries the call — a two-line verdict
     title with the direction first, the invalidation and
     measured-move levels, and the most recent trap marker. The
@@ -3702,29 +3561,6 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
                              line=dict(width=1.4, color="#f59e0b")), row=1, col=1)
     fig.add_trace(go.Scatter(x=x, y=df["EMA21"], name="EMA 21",
                              line=dict(width=1.4, color="#2563eb")), row=1, col=1)
-    if show.get("ema_long"):
-        fig.add_trace(go.Scatter(x=x, y=df["EMA50"], name="EMA 50",
-                                 line=dict(width=1.2, color="#db2777")),
-                      row=1, col=1)
-        fig.add_trace(go.Scatter(x=x, y=df["EMA200"], name="EMA 200",
-                                 line=dict(width=1.8, color="#1f2937")),
-                      row=1, col=1)
-    # Daily EMA 50/200 reference lines: flat lines from daily closes
-    # (completed sessions only) — the daily clock, not the bar-size
-    # clock. Same colours as the intraday EMA 50/200 so the colour
-    # language matches; flat + "(daily)" tells them apart. Two-point
-    # traces, so they appear in the legend with their values.
-    if show.get("daily_ema") and daily_ema:
-        for key, color, width in (("ema50", "#db2777", 2.2),
-                                  ("ema200", "#1f2937", 2.2)):
-            val = daily_ema.get(key)
-            if val is None:
-                continue
-            fig.add_trace(go.Scatter(
-                x=[x[0], x[-1]], y=[val, val],
-                name=f"EMA {key[3:]} (daily) ${val:,.2f}",
-                mode="lines", line=dict(width=width, color=color)),
-                row=1, col=1)
     fig.add_trace(go.Scatter(x=x, y=df["VWAP"], name="VWAP",
                              line=dict(width=1.2, color="#7c3aed", dash="dash")),
                   row=1, col=1)
@@ -3941,16 +3777,6 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
             cands += [pa["PDH"], pa["PDC"], pa["PDL"]]
         if orng:
             cands += [orng["high"], orng["low"]]
-        # Daily EMA lines are levels too — they join `cands` and follow
-        # the same one-span rule. (The first version extended the axis
-        # to any drawn daily line, which on a narrow-range day stretched
-        # the panel to 10x the session range and squashed the candles
-        # into a sliver — the Nov 12 AAPL screenshot. Never again.)
-        if show.get("daily_ema") and daily_ema:
-            for key in ("ema50", "ema200"):
-                v = daily_ema.get(key)
-                if v is not None:
-                    cands.append(v)
         for v in cands:
             if base_lo - span <= v <= base_hi + span:
                 ylo = min(ylo, v - pad * 0.5)
@@ -4103,9 +3929,8 @@ with st.sidebar:
     tf_label = st.selectbox("Bar size", ["1 min", "5 min", "15 min"], index=0)
     chart_tf = st.selectbox(
         "Chart timeframe",
-        ["5 minutes", "15 minutes", "1 hour", "2 hours", "3 hours",
-         "4 hours", "Since market open"],
-        index=6,
+        ["5 minutes", "15 minutes", "Since market open"],
+        index=2,
         help="How much recent history the chart shows — same control as the "
              "stock-analyzer's. Zones, trendlines and formations are "
              "computed on the full session and stay drawn across the window.")
@@ -4133,12 +3958,6 @@ with st.sidebar:
             value=True),
         "patterns": st.checkbox("Candlestick formations", value=True),
         "phases": st.checkbox("Time-cycle phases", value=True),
-        "ema_long": st.checkbox("EMA 50 / 200 (trend context)", value=True),
-        "daily_ema": st.checkbox("Daily EMA 50 / 200 reference lines",
-                                 value=True),
-        "trend_template": st.checkbox(
-            "Trend Template (Minervini) — daily SMA 50/150/200, "
-            "52-week high/low, stage label", value=True),
         "volume_profile": st.checkbox(
             "Volume profile (POC / value area)", value=True),
     }
@@ -4199,14 +4018,13 @@ def render():
     vp = session_volume_profile(disp)
     chart_pats = detect_chart_patterns(disp)
 
-    # Minervini daily context (Trend Template + volume pace): one daily
-    # OHLCV pull on a slow daily bucket, shared by both. A failed or
-    # too-short pull just hides the Template and the pace, never the
-    # chart — the intraday detectors do not depend on it.
+    # Daily context for the pattern volume pace: one daily OHLCV pull
+    # on a slow daily bucket. A failed or too-short pull just hides
+    # the pace, never the chart — the intraday detectors do not
+    # depend on it.
     daily_bars = None
-    template = None
     avg_daily_vol = None
-    if show.get("trend_template") or show.get("chart_patterns"):
+    if show.get("chart_patterns"):
         try:
             daily_bars = fetch_daily_bars(
                 symbol,
@@ -4215,11 +4033,6 @@ def render():
         except Exception:
             daily_bars = None
     if daily_bars is not None and not daily_bars.empty:
-        if show.get("trend_template"):
-            try:
-                template = trend_template(daily_bars, sel_date)
-            except Exception:
-                template = None
         try:
             prior_vol = daily_bars["Volume"][
                 [d < sel_date for d in daily_bars.index]]
@@ -4259,48 +4072,12 @@ def render():
               f"{wconf['score']} / 100" if wconf else "—",
               wconf["direction"] if wconf else None, delta_color="off")
 
-    # Daily EMA 50/200 reference lines — daily closes through the last
-    # completed session (no lookahead). Fetched only when the toggle is
-    # on, on a slow daily bucket (the values change once a day); a failed
-    # or too-short pull just skips the lines, never the chart. A line
-    # more than DAILY_EMA_MAX_DIST from the last price is not drawn at
-    # all (too far to be a useful reference); a drawn line extends the
-    # price axis only when it sits within one session-range of the
-    # action, like every other level — farther lines stay off-view until
-    # price approaches them, and the caption names their values.
-    daily_levels = None
-    daily_ema = None
-    daily_ema_skipped: list[tuple[str, float]] = []
-    if show.get("daily_ema"):
-        try:
-            closes = fetch_daily_closes(
-                symbol,
-                _bucket(live, int(refresh_secs), bucket_secs=86400),
-                end=view_date.isoformat() if past_mode else "")
-            daily_levels = daily_ema_levels(closes, sel_date)
-        except Exception:
-            daily_levels = None
-        if daily_levels:
-            daily_ema = dict(daily_levels)
-            last_px = float(last["Close"])
-            for key in ("ema50", "ema200"):
-                val = daily_ema.get(key)
-                if (val is not None
-                        and abs(val - last_px) / last_px
-                        > DAILY_EMA_MAX_DIST):
-                    daily_ema_skipped.append((key, val))
-                    daily_ema[key] = None
-            if (daily_ema.get("ema50") is None
-                    and daily_ema.get("ema200") is None):
-                daily_ema = None
-
     trailing = CHART_TF_TRAILING[chart_tf]
     window_start = (disp.index[-1] - pd.Timedelta(minutes=trailing)
                     if trailing is not None else None)
     st.plotly_chart(build_chart(disp, symbol, zones, lines, pats, level_vals,
                                 pa, orng, show, window_start=window_start,
-                                chart_patterns=chart_pats, vp=vp,
-                                daily_ema=daily_ema),
+                                chart_patterns=chart_pats, vp=vp),
                     use_container_width=True,
                     key=f"pa_{symbol}_{tf_label}_{chart_tf.replace(' ', '_')}")
 
@@ -4320,65 +4097,6 @@ def render():
         else:
             st.caption("Volume profile unavailable for this session — no "
                        "usable price range or volume.")
-
-    if show.get("daily_ema"):
-        if daily_ema:
-            last_px = float(last["Close"])
-            parts = []
-            for key, label in (("ema50", "Daily EMA 50"),
-                               ("ema200", "Daily EMA 200")):
-                val = daily_ema.get(key)
-                if val is not None:
-                    pct = (val - last_px) / last_px * 100
-                    rel = (f"{abs(pct):.1f}% below price" if pct < -0.05
-                           else f"{abs(pct):.1f}% above price" if pct > 0.05
-                           else "at price")
-                    parts.append(f"{label} ${val:,.2f} ({rel})")
-            skipped = ""
-            if daily_ema_skipped:
-                skipped = " " + "; ".join(
-                    f"EMA {k[3:]} (daily) ${v:,.2f} is more than "
-                    f"{DAILY_EMA_MAX_DIST:.0%} from price — line hidden"
-                    for k, v in daily_ema_skipped) + "."
-            st.caption(
-                " · ".join(parts) + " — flat reference lines from daily "
-                f"closes through {daily_ema['asof']} "
-                f"({daily_ema['n']} sessions). The EMA 50 / 200 lines on "
-                f"the chart are the last 50 / 200 minutes on {tf_label} "
-                f"bars; these are the daily clock.{skipped} Display only "
-                f"— not scored in the weighted confluence.")
-        elif daily_levels is not None:
-            # Levels loaded, but every line was hidden by the distance guard.
-            st.caption(
-                "Daily EMA 50 / 200 reference lines hidden — "
-                + "; ".join(
-                    f"EMA {k[3:]} (daily) ${v:,.2f}"
-                    for k, v in daily_ema_skipped)
-                + f" are more than {DAILY_EMA_MAX_DIST:.0%} from price.")
-        else:
-            st.caption("Daily EMA 50 / 200 reference lines unavailable — "
-                       "daily bars could not be loaded for this session.")
-
-    if show.get("trend_template"):
-        if template:
-            lines = [f"**Trend Template (Minervini)** — "
-                     f"{template['met']}/7 met · {template['stage']}"]
-            for c in template["criteria"]:
-                mark = ("✓" if c["met"] is True
-                        else "✗" if c["met"] is False else "—")
-                lines.append(f"- {mark} {c['label']}")
-            st.markdown("\n".join(lines))
-            st.caption("Minervini's Trend Template (Ch. 5, p. 79) on "
-                       "daily bars through "
-                       f"{template['asof']} ({template['n']} sessions). "
-                       "Simple moving averages per the book — not the "
-                       "app's daily EMA lines. RS ranking is IBD data "
-                       "and is not available here. Context only — it "
-                       "does not change the weighted confluence score.")
-        else:
-            st.caption("Trend Template unavailable — need 252 daily "
-                       "sessions; daily bars could not be loaded for "
-                       "this session.")
 
     if show.get("chart_patterns"):
         st.markdown("**Pattern recognition** (the book's chart patterns — "
@@ -4415,11 +4133,6 @@ def render():
                     f"{pat['status']}** · {trigger} · {invalid} · "
                     f"{pat['detail']}{extra}")
             st.markdown("\n".join(rows))
-            if template and template["stage"].startswith("Stage 4"):
-                st.caption("⚠️ These patterns fired in a Stage 4 "
-                           "(declining) daily context — Minervini would "
-                           "not buy a base here (p. 190). The patterns "
-                           "are shown, not suppressed.")
         else:
             st.caption("No qualifying chart pattern in the current session "
                        "yet. The detector requires a repeated range, "
@@ -4515,12 +4228,7 @@ with st.expander("How to read this chart"):
         "invalidation is the opposite boundary. A flag/pennant is only "
         "recognized after a fierce pole followed by a small contained "
         "pause, as the book defines it.\n"
-        "- **Minervini: Trend Template, VCP, pivot** — the Template panel "
-        "under the chart checks the stock against the book's eight "
-        "criteria (SMA 50/150/200, 200-day slope, 52-week high/low) on "
-        "daily bars and names the life-cycle stage (2 = advancing, 4 = "
-        "declining); a range in a Stage 4 context is shown, not "
-        "suppressed, with a warning. A **VCP** is a sequence of "
+        "- **Minervini: VCP, pivot** — a **VCP** is a sequence of "
         "successive pullbacks each about half the previous one with "
         "volume drying up — the pivot is the last contraction's high. "
         "Every pattern's trigger is labeled **Pivot** and its "
@@ -4562,13 +4270,8 @@ with st.expander("How to read this chart"):
         "not scored in the weighted confluence. Toggle it off in the "
         "sidebar (Show → Volume profile) if the chart feels crowded.\n"
         "- **EMA lines** — 9 (amber) and 21 (blue) are the book's "
-        "crossover pair; 50 (pink) and 200 (dark) are trend context at "
-        "the chosen bar size, warmed up on the loaded prior sessions "
-        "like the stochastic — on 1-minute bars the 200 spans roughly "
-        "the last 3⅓ hours, on 5-minute bars roughly the last 2½ "
-        "sessions. Price holding above both is the wind at a long's "
-        "back; below both, at a short's. Toggle them off in the sidebar "
-        "(Show → EMA 50 / 200) if the chart feels crowded.\n"
+        "crossover pair: price above both with 9 above 21 is the wind "
+        "at a long's back; below both, at a short's.\n"
         "- **Stochastic (bottom)** — momentum shifts: blue %K crossing orange "
         "%D is the event; crossing up from under 20 or down from over 80 is "
         "the one that matters, especially right at a level.\n"
