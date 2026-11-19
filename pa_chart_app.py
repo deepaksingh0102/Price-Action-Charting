@@ -2835,7 +2835,237 @@ def brooks_day_read(d5: pd.DataFrame, pa: dict | None,
         out["verdict_reason"] = (
             f"Always-in {out['always_label']} ({max(bull, bear)}/4 votes) "
             f"+ {day_type.lower()}; no trend, so no strength checklist.")
+
+    # Schwager (Part Four, Ch. 17 rules 14/15): the price that undoes
+    # the verdict — a 5-min close through it means the original premise
+    # is violated and the trade is exited, even if no stop was hit. A
+    # Hold has no direction to invalidate. The opening-range edge is
+    # the level; the spike extreme is the fallback on a spike day, the
+    # session extreme the last resort. Each fallback is only used when
+    # it sits on the right side of the last close — a stop above the
+    # entry for a long is not a stop.
+    invalidation = None
+    invalidation_label = None
+    last_close = float(c[-1])
+    if verdict == "Buy":
+        if orng and orng["low"] < last_close:
+            invalidation = orng["low"]
+            invalidation_label = "opening-range low"
+        elif spike and spike["direction"] > 0 \
+                and spike["extreme"] < last_close:
+            invalidation = spike["extreme"]
+            invalidation_label = "spike low"
+        elif float(l.min()) < last_close:
+            invalidation = float(l.min())
+            invalidation_label = "session low"
+    elif verdict == "Sell":
+        if orng and orng["high"] > last_close:
+            invalidation = orng["high"]
+            invalidation_label = "opening-range high"
+        elif spike and spike["direction"] < 0 \
+                and spike["extreme"] > last_close:
+            invalidation = spike["extreme"]
+            invalidation_label = "spike high"
+        elif float(h.max()) > last_close:
+            invalidation = float(h.max())
+            invalidation_label = "session high"
+    out["invalidation"] = invalidation
+    out["invalidation_label"] = invalidation_label
+
+    # Schwager (Part Four, Ch. 17 rules 56/57/58/76): a failed signal
+    # is more reliable than the original — an opening-range breakout
+    # that closes back inside the range is a bull/bear trap. Only live
+    # as of the last bar: if price re-broke out and is holding outside,
+    # the failure is stale and is not flagged. The trap extreme (the
+    # stop for the other way) is the furthest price reached after the
+    # break.
+    or_failed = None
+    if brk_i is not None and orng:
+        if brk_dir > 0 and float(c[-1]) < orng["high"]:
+            back = [i for i in range(brk_i + 1, n)
+                    if float(c[i]) < orng["high"]]
+            if back:
+                or_failed = {"kind": "Bull trap",
+                             "source": "Opening range",
+                             "extreme": float(h[brk_i:].max()),
+                             "brk_i": brk_i, "fail_i": back[0]}
+        elif brk_dir < 0 and float(c[-1]) > orng["low"]:
+            back = [i for i in range(brk_i + 1, n)
+                    if float(c[i]) > orng["low"]]
+            if back:
+                or_failed = {"kind": "Bear trap",
+                             "source": "Opening range",
+                             "extreme": float(l[brk_i:].min()),
+                             "brk_i": brk_i, "fail_i": back[0]}
+    out["or_failed"] = or_failed
     return out
+
+
+def schwager_day_reads(d5: pd.DataFrame, pa: dict | None,
+                       orng: dict | None, read: dict,
+                       chart_pats: list[dict] | None) -> dict:
+    """Schwager, Getting Started in Technical Analysis, Part Four —
+    the codable pieces for the Brooks tab. Failed breakouts (Ch. 17
+    rules 56/57/58/62/76): an opening-range breakout (from
+    brooks_day_read) or a range breakout (the range detector's
+    'BACK IN RANGE' status) that closed back inside is a bull/bear
+    trap, and the lean flips the other way with the pre-failure
+    extreme as the stop. Wide-range reversal bar (rule 65): a bar
+    with >= 2x the session median bar range closing against the
+    trend. Gap filled vs still open (rules 53-55, 69). Where a
+    consolidation sits inside the session range (rule 49). Position
+    size from the verdict's invalidation price (Ch. 16 step 3;
+    Ch. 18 rule 9): risk per share and shares for 1% of a $100k
+    account, display-only. Anything that does not apply is None, so
+    the panel only shows lines that exist. Pattern-level failures
+    are deliberately not re-derived here: the range and opening-range
+    breakouts are the book's cases, and the pattern detectors only
+    carry their current status."""
+    out = {"failed": [], "failed_lean": 0, "wide_reversal": None,
+           "gap": None, "consol": None, "size": None}
+    if d5 is None or len(d5) < 10 or not read:
+        return out
+    n = len(d5)
+    o = d5["Open"].to_numpy(dtype=float)
+    h = d5["High"].to_numpy(dtype=float)
+    l = d5["Low"].to_numpy(dtype=float)
+    c = d5["Close"].to_numpy(dtype=float)
+    last_close = float(c[-1])
+
+    def _time(i: int) -> str:
+        try:
+            return d5.index[int(i)].strftime("%H:%M")
+        except Exception:
+            return ""
+
+    # Failed breakouts, most recent first. The opening-range failure
+    # comes from brooks_day_read; the range failure from the range
+    # detector's own 'BACK IN RANGE' status (it already requires the
+    # break to be recent and the last close back inside).
+    failed = []
+    orf = read.get("or_failed")
+    if orf:
+        failed.append({"kind": orf["kind"], "source": orf["source"],
+                       "extreme": orf["extreme"],
+                       "time": _time(orf["fail_i"]),
+                       "fail_i": orf["fail_i"]})
+    rng = None
+    for p in (chart_pats or []):
+        if p.get("family") == "consolidation" and p.get("box"):
+            rng = p
+            break
+    if rng and rng.get("status") in ("BREAKOUT / BACK IN RANGE",
+                                     "BREAKDOWN / BACK IN RANGE"):
+        box = rng["box"]
+        y0, y1 = float(box["y0"]), float(box["y1"])
+        x0 = int(box["x0"])
+        if rng["status"].startswith("BREAKOUT"):
+            brk = [i for i in range(x0, n) if float(c[i]) > y1]
+            back = [i for i in range(brk[0] + 1, n) if float(c[i]) < y1] \
+                if brk else []
+            if brk and back:
+                failed.append({"kind": "Bull trap",
+                               "source": "Range",
+                               "extreme": float(h[brk[0]:].max()),
+                               "time": _time(back[0]),
+                               "fail_i": back[0]})
+        else:
+            brk = [i for i in range(x0, n) if float(c[i]) < y0]
+            back = [i for i in range(brk[0] + 1, n) if float(c[i]) > y0] \
+                if brk else []
+            if brk and back:
+                failed.append({"kind": "Bear trap",
+                               "source": "Range",
+                               "extreme": float(l[brk[0]:].min()),
+                               "time": _time(back[0]),
+                               "fail_i": back[0]})
+    failed.sort(key=lambda f: f["fail_i"], reverse=True)
+    out["failed"] = failed
+    if failed:
+        out["failed_lean"] = -1 if failed[0]["kind"] == "Bull trap" else 1
+
+    # Wide-range reversal bar (rule 65): range >= 2x the session
+    # median bar range, closing counter to the trend direction. The
+    # Brooks counter-spike check measures body; this one measures
+    # range, so the two do not double-count the same bar.
+    trend_dir = read.get("always_in", 0) or (
+        read["spike"]["direction"] if read.get("spike") else 0)
+    med = _brooks_median_range(d5)
+    if trend_dir and med > 0:
+        ranges = h - l
+        for i in range(n - 1, -1, -1):
+            if ranges[i] < 2.0 * med:
+                continue
+            counter = (trend_dir > 0 and c[i] < o[i]) or \
+                (trend_dir < 0 and c[i] > o[i])
+            if counter:
+                out["wide_reversal"] = {
+                    "time": _time(i),
+                    "multiple": float(ranges[i] / med),
+                    "direction": "down" if trend_dir > 0 else "up"}
+                break
+
+    # Gap filled vs still open (rules 53-55, 69). A gap too small to
+    # matter (< 0.10%) gets no line.
+    pdc = pa["PDC"] if pa else None
+    gap_pct = read.get("gap_pct", 0.0) or 0.0
+    if pdc and abs(gap_pct) >= 0.10:
+        fill_i = None
+        if gap_pct > 0:
+            hits = [i for i in range(n) if float(l[i]) <= pdc]
+            fill_i = hits[0] if hits else None
+        else:
+            hits = [i for i in range(n) if float(h[i]) >= pdc]
+            fill_i = hits[0] if hits else None
+        out["gap"] = {"pct": gap_pct, "filled": fill_i is not None,
+                      "fill_time": _time(fill_i) if fill_i is not None
+                      else None}
+
+    # Where the consolidation sits inside the session range (rule
+    # 49): near the top is a bullish lean, near the bottom bearish.
+    if rng:
+        box = rng["box"]
+        ses_hi, ses_lo = float(h.max()), float(l.min())
+        if ses_hi > ses_lo:
+            mid = (float(box["y0"]) + float(box["y1"])) / 2.0
+            pos = (mid - ses_lo) / (ses_hi - ses_lo)
+            if pos >= 2.0 / 3.0:
+                label = "near the session high — bullish lean"
+            elif pos <= 1.0 / 3.0:
+                label = "near the session low — bearish lean"
+            else:
+                label = "mid-range — no lean"
+            out["consol"] = {"position": round(pos, 2), "label": label}
+
+    # Position size from the verdict's invalidation price (Ch. 16
+    # step 3; Ch. 18 rule 9): 1% of a $100k account, display-only.
+    # The daily swing run's 0.5% rule is a different system and is
+    # not touched by this line.
+    inv = read.get("invalidation")
+    if read.get("verdict") in ("Buy", "Sell") and inv is not None:
+        risk = abs(last_close - float(inv))
+        if risk > 0:
+            out["size"] = {"entry": last_close, "stop": float(inv),
+                           "risk_per_share": risk,
+                           "shares": int(1000.0 // risk)}
+    return out
+
+
+def _schwager_rel_line(sym: str, chg: float, peer: str,
+                       peer_chg: float | None) -> str | None:
+    """SPY vs QQQ relative strength (Ch. 17 rule 71): a market
+    holding firm while a related market is under pressure shows
+    intrinsic strength, and vice versa. Both day changes are vs the
+    prior close."""
+    if peer_chg is None:
+        return None
+    diff = chg - peer_chg
+    if abs(diff) < 0.05:
+        return (f"{sym} and {peer} are even today "
+                f"({chg:+.2f}% each)")
+    stronger = sym if diff > 0 else peer
+    return (f"{stronger} stronger by {abs(diff):.2f} pts today "
+            f"({sym} {chg:+.2f}% vs {peer} {peer_chg:+.2f}%)")
 
 
 def _brooks_symbol_data(sym: str):
@@ -2881,41 +3111,69 @@ def render_brooks():
     tab per symbol on 5-minute bars, each with the full chart (zones,
     trendlines, patterns, volume profile) and the Brooks read
     underneath: day type, always-in, spike/channel phase, High/Low
-    leg count, measured moves, strength checklist. No PCR, no weighted
+    leg count, measured moves, strength checklist, plus the Schwager
+    Part Four section (verdict invalidation, position size, failed
+    breakouts, wide-range reversal bar, gap status, consolidation
+    position, SPY vs QQQ relative strength). No PCR, no weighted
     confluence, no Trend Template here — those live on the
-    single-symbol tab."""
+    single-symbol tab. Both symbols are gathered first so each panel
+    can quote the other's day change (Schwager rule 71)."""
     show_b = dict(show)
     show_b["daily_ema"] = False
+    per_sym = {}
+    for sym in BROOKS_SYMBOLS:
+        data, err = _brooks_symbol_data(sym)
+        if err:
+            per_sym[sym] = {"error": err}
+            continue
+        disp = data["disp"]
+        pa = data["pa"]
+        orng = data["orng"]
+        zones = sr_zones(disp)
+        lines = trendlines(disp)
+        vp = session_volume_profile(disp)
+        chart_pats = detect_chart_patterns(disp)
+        pats = candle_patterns(disp)
+        level_vals = ([pa["PDH"], pa["PDC"], pa["PDL"]] if pa else []) \
+            + [z["center"] for z in zones] \
+            + ([orng["high"], orng["low"]] if orng else [])
+        read = brooks_day_read(disp, pa, data["daily"], orng,
+                               data["sel_date"], lines=lines)
+        schw = schwager_day_reads(disp, pa, orng, read, chart_pats)
+        last = disp.iloc[-1]
+        prev_close = pa["PDC"] if pa else float(disp["Close"].iloc[0])
+        chg = (float(last["Close"]) / prev_close - 1) * 100 \
+            if prev_close else 0.0
+        per_sym[sym] = {"disp": disp, "pa": pa, "orng": orng,
+                        "zones": zones, "lines": lines, "vp": vp,
+                        "chart_pats": chart_pats, "pats": pats,
+                        "level_vals": level_vals, "read": read,
+                        "schw": schw, "last": last, "chg": chg}
     tabs = st.tabs([f"{sym} — Brooks" for sym in BROOKS_SYMBOLS])
     for tab, sym in zip(tabs, BROOKS_SYMBOLS):
         with tab:
-            data, err = _brooks_symbol_data(sym)
-            if err:
-                st.info(err)
+            info = per_sym[sym]
+            if "error" in info:
+                st.info(info["error"])
                 continue
-            disp = data["disp"]
-            pa = data["pa"]
-            orng = data["orng"]
-            zones = sr_zones(disp)
-            lines = trendlines(disp)
-            vp = session_volume_profile(disp)
-            chart_pats = detect_chart_patterns(disp)
-            pats = candle_patterns(disp)
-            level_vals = ([pa["PDH"], pa["PDC"], pa["PDL"]] if pa else []) \
-                + [z["center"] for z in zones] \
-                + ([orng["high"], orng["low"]] if orng else [])
-            read = brooks_day_read(disp, pa, data["daily"], orng,
-                                   data["sel_date"], lines=lines)
-            last = disp.iloc[-1]
-            prev_close = pa["PDC"] if pa else float(disp["Close"].iloc[0])
-            chg = (float(last["Close"]) / prev_close - 1) * 100 \
-                if prev_close else 0.0
+            peer = BROOKS_SYMBOLS[1] if sym == BROOKS_SYMBOLS[0] \
+                else BROOKS_SYMBOLS[0]
+            peer_chg = per_sym[peer].get("chg") \
+                if "error" not in per_sym[peer] else None
+            disp = info["disp"]
+            pa = info["pa"]
+            orng = info["orng"]
+            read = info["read"]
+            schw = info["schw"]
+            last = info["last"]
+            chg = info["chg"]
             st.metric(sym, f"${float(last['Close']):,.2f}",
                       f"{chg:+.2f}% vs prior close")
             st.plotly_chart(
-                build_chart(disp, sym, zones, lines, pats, level_vals,
+                build_chart(disp, sym, info["zones"], info["lines"],
+                            info["pats"], info["level_vals"],
                             pa, orng, show_b, window_start=None,
-                            chart_patterns=chart_pats, vp=vp,
+                            chart_patterns=info["chart_pats"], vp=info["vp"],
                             daily_ema=None),
                 use_container_width=True, key=f"brooks_{sym}_5min")
             v = read["verdict"]
@@ -2951,13 +3209,68 @@ def render_brooks():
                 for label, m in read["strength"]:
                     slines.append(f"- {'✓' if m else '✗'} {label}")
                 st.markdown("\n".join(slines))
+            # Schwager Part Four — only lines that apply are shown.
+            glines = []
+            if read["invalidation"] is not None:
+                glines.append(
+                    f"- **Invalidation:** a 5-min close "
+                    f"{'below' if v == 'Buy' else 'above'} "
+                    f"${read['invalidation']:,.2f} "
+                    f"({read['invalidation_label']}) undoes this {v}.")
+            if schw["size"]:
+                s = schw["size"]
+                glines.append(
+                    f"- **Size it:** entry ${s['entry']:,.2f}, stop "
+                    f"${s['stop']:,.2f}, risk "
+                    f"${s['risk_per_share']:.2f}/share → {s['shares']} "
+                    "shares at 1% of $100k.")
+            for fb in schw["failed"][:1]:
+                lean = "bearish" if fb["kind"] == "Bull trap" \
+                    else "bullish"
+                conflict = ""
+                if (fb["kind"] == "Bull trap" and v == "Buy") or \
+                        (fb["kind"] == "Bear trap" and v == "Sell"):
+                    conflict = f" — conflicts with the {v} verdict"
+                glines.append(
+                    f"- **Failed breakout:** {fb['kind']} — broke out "
+                    f"of the {fb['source'].lower()} to "
+                    f"${fb['extreme']:,.2f}, closed back inside at "
+                    f"{fb['time']}; lean flips {lean}, stop "
+                    f"{'above' if fb['kind'] == 'Bull trap' else 'below'} "
+                    f"${fb['extreme']:,.2f}{conflict}.")
+            if schw["wide_reversal"]:
+                wr = schw["wide_reversal"]
+                glines.append(
+                    f"- **Wide-range reversal bar:** {wr['time']} — "
+                    f"range {wr['multiple']:.1f}× the session median "
+                    f"bar range, closed {wr['direction']} against the "
+                    "trend (Rule 65).")
+            if schw["gap"]:
+                g = schw["gap"]
+                glines.append(
+                    f"- **Gap:** {g['pct']:+.1f}% open — "
+                    f"{'filled at ' + g['fill_time'] if g['filled'] else 'still open'}.")
+            if schw["consol"]:
+                glines.append(
+                    f"- **Consolidation:** the range sits "
+                    f"{schw['consol']['label']} (Rule 49).")
+            rel = _schwager_rel_line(sym, chg, peer, peer_chg)
+            if rel:
+                glines.append(f"- **vs {peer}:** {rel} (Rule 71).")
+            if glines:
+                st.markdown(
+                    "**Schwager — Getting Started in Technical "
+                    "Analysis, Part Four**\n" + "\n".join(glines))
             st.caption(
                 f"{read['day_evidence']} — Brooks, Trading Price "
                 "Action Trends, on 5-min bars. Confirmation counts how "
                 "much of the read lines up behind the direction "
                 "(strength checklist, always-in votes, day type) — it "
                 "is not a win probability, and the book's reliability "
-                "claims do not transfer to a single day.")
+                "claims do not transfer to a single day. Schwager's "
+                "own Rule 44 warns intraday decisions are almost "
+                "always losers — this is a read of location and "
+                "permission, not a forecast.")
     st.caption(
         f"Alpaca {str(_feed).upper()} · 5-min bars, full session · "
         f"SPY + QQQ · updated {datetime.now(ET).strftime('%H:%M:%S')} "
