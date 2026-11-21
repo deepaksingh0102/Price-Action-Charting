@@ -101,7 +101,7 @@ ALPACA_BASE = "https://data.alpaca.markets/v2"
 # Version stamp: the footer shows this tag plus a hash computed live from
 # the deployed file itself, so the page proves which build is running —
 # compare it with the hash named when the file was delivered.
-BUILD_TAG = "2026-11-20-single-symbol-decision"
+BUILD_TAG = "2026-11-21-continuation-v11"
 
 
 def _build_hash() -> str:
@@ -4002,6 +4002,128 @@ def render_single_symbol_decision(read, symbol):
                "and out-of-sample validation before risking capital.")
 
 
+# ---------------------------------------------------------------- Causal trend-continuation research (V11)
+def continuation_events(df: pd.DataFrame, orng: dict | None = None) -> pd.DataFrame:
+    """Causal bar-by-bar replay; never inspects candles after the event.
+
+    Signals are hypotheses, not predictions of profitable trades. Event time is
+    the close of the signal bar (Alpaca timestamps identify bar starts).
+    """
+    columns = ["bar_end", "direction", "event", "status", "close", "level",
+               "invalidation", "volume_ratio", "reason"]
+    if df is None or len(df) < 27:
+        return pd.DataFrame(columns=columns)
+    bar_minutes = max(1, int(round((df.index[1] - df.index[0]).total_seconds() / 60)))
+    events = []
+    active = None
+    # Restrict to this session; no future swing extrema are used.
+    for i in range(26, len(df)):
+        d = df.iloc[:i + 1]
+        bar = d.iloc[-1]
+        prior = d.iloc[:-1]
+        close, high, low = [float(bar[k]) for k in ("Close", "High", "Low")]
+        e9, e21, vw = [float(bar[k]) for k in ("EMA9", "EMA21", "VWAP")]
+        if not all(np.isfinite(x) for x in (e9, e21, vw)):
+            continue
+        base = float(prior["Volume"].tail(20).median())
+        vr = float(bar["Volume"]) / base if base > 0 else 0.0
+        slope = e21 - float(d["EMA21"].iloc[-6])
+        trend = -1 if close < vw and e9 < e21 and slope < 0 else (1 if close > vw and e9 > e21 and slope > 0 else 0)
+        # Confirmed structure uses prior completed bars, not centered swings.
+        old_hi = float(prior["High"].iloc[-24:-12].max())
+        new_hi = float(prior["High"].iloc[-12:].max())
+        old_lo = float(prior["Low"].iloc[-24:-12].min())
+        new_lo = float(prior["Low"].iloc[-12:].min())
+        structure = -1 if new_hi < old_hi and new_lo < old_lo else (1 if new_hi > old_hi and new_lo > old_lo else 0)
+        prior12_hi = float(prior["High"].tail(12).max())
+        prior12_lo = float(prior["Low"].tail(12).min())
+        bar_end = df.index[i] + pd.Timedelta(minutes=bar_minutes)
+        event = None
+        level = None
+        why = None
+        if trend == -1:
+            if close < prior12_lo and vr >= 1.2:
+                event, level, why = "Fresh breakdown", prior12_lo, "Closed below prior 12-bar low with expanding volume"
+            elif structure == -1 and float(prior["Close"].iloc[-1]) >= float(prior["EMA9"].iloc[-1]) and close < e9 and close < float(prior["Low"].iloc[-1]):
+                event, level, why = "EMA9 pullback rejection", e9, "Rejected EMA9 and broke prior bar low"
+            elif structure == -1 and float(prior["High"].tail(4).max()) >= float(prior["EMA21"].tail(4).min()) and close < e9 and close < float(prior["Low"].iloc[-1]):
+                event, level, why = "Bearish continuation", prior12_lo, "Lower highs/lows and EMA21 pullback failed"
+            elif structure == -1 and active is None:
+                event, level, why = "Bearish trend established", prior12_lo, "Lower highs/lows; price below VWAP and bearish EMAs"
+        elif trend == 1:
+            if close > prior12_hi and vr >= 1.2:
+                event, level, why = "Fresh breakout", prior12_hi, "Closed above prior 12-bar high with expanding volume"
+            elif structure == 1 and float(prior["Close"].iloc[-1]) <= float(prior["EMA9"].iloc[-1]) and close > e9 and close > float(prior["High"].iloc[-1]):
+                event, level, why = "EMA9 pullback reclaim", e9, "Reclaimed EMA9 and broke prior bar high"
+            elif structure == 1 and active is None:
+                event, level, why = "Bullish trend established", prior12_hi, "Higher highs/lows; price above VWAP and bullish EMAs"
+        # Invalidate against a known price, not a retrospectively redrawn line.
+        if active is not None:
+            side = active["direction"]
+            stop = active["invalidation"]
+            if (side == "DOWN" and close > stop) or (side == "UP" and close < stop):
+                events.append({"bar_end": bar_end, "direction": side,
+                               "event": active["event"], "status": "FAILED",
+                               "close": close, "level": active["level"],
+                               "invalidation": stop, "volume_ratio": vr,
+                               "reason": "Completed close crossed original invalidation"})
+                active = None
+            elif trend != (-1 if side == "DOWN" else 1):
+                # Mark weakening once, while keeping the original stop fixed.
+                if not active.get("weakening"):
+                    events.append({"bar_end": bar_end, "direction": side,
+                                   "event": active["event"], "status": "WEAKENING",
+                                   "close": close, "level": active["level"],
+                                   "invalidation": stop, "volume_ratio": vr,
+                                   "reason": "Trend alignment weakened; original stop remains"})
+                    active["weakening"] = True
+        if event is not None:
+            side = "DOWN" if trend == -1 else "UP"
+            # Use only past swing window and current candle to set a fixed stop.
+            stop = max(float(prior["High"].tail(5).max()), e21) if trend == -1 else min(float(prior["Low"].tail(5).min()), e21)
+            valid = stop > close if trend == -1 else stop < close
+            if valid and (active is None or active["direction"] != side or active["event"] != event):
+                active = {"direction": side, "event": event, "level": level,
+                          "invalidation": stop, "weakening": False}
+                events.append({"bar_end": bar_end, "direction": side,
+                               "event": event, "status": "CONFIRMED" if "break" in event.lower() or "rejection" in event.lower() else "DETECTED",
+                               "close": close, "level": level,
+                               "invalidation": stop, "volume_ratio": vr,
+                               "reason": why})
+    result = pd.DataFrame(events, columns=columns)
+    if active is not None and len(result):
+        # The current state is distinct from the historical event timestamp.
+        result.attrs["active"] = active
+    return result
+
+
+def render_continuation_engine(df: pd.DataFrame, symbol: str) -> None:
+    st.markdown(f"### {symbol} | Trend continuation & signal lifecycle")
+    events = continuation_events(df)
+    if events.empty:
+        st.info("No qualifying trend lifecycle events yet. This does not imply a sideways market.")
+        return
+    active = events.attrs.get("active")
+    if active:
+        st.markdown(f"**Active hypothesis: {active['direction']} — {active['event']}** · "
+                    f"Fixed invalidation ${active['invalidation']:,.2f} · "
+                    f"{'WEAKENING' if active.get('weakening') else 'ACTIVE'}")
+    else:
+        st.markdown("**Current state: NO ACTIVE HYPOTHESIS** — previous signals may have failed.")
+    st.caption("Events are stamped at completed candle close. Direction is a qualitative "
+               "trend hypothesis, not a calibrated price forecast. A DETECTED trend "
+               "does not itself confirm an entry; breakout volume is only required "
+               "for the fresh-breakout category.")
+    shown = events.tail(20).iloc[::-1].copy()
+    shown["bar_end"] = shown["bar_end"].dt.strftime("%Y-%m-%d %H:%M ET")
+    for col in ("close", "level", "invalidation", "volume_ratio"):
+        shown[col] = shown[col].round(2)
+    st.dataframe(shown, use_container_width=True, hide_index=True)
+    st.caption("Replay is causal and includes no future-bar pivot confirmation. "
+               "Results have not been backtested for net profitability; this is "
+               "not an instruction to enter a trade.")
+
+
 # ---------------------------------------------------------------- UI
 st.set_page_config(page_title="Price-Action Charting", layout="wide")
 st.title("📐 Price-Action Charting")
@@ -4196,6 +4318,7 @@ def render():
         if len(completed) >= 22 else [], sr_zones(completed)
         if len(completed) >= 22 else [])
     render_single_symbol_decision(decision, symbol)
+    render_continuation_engine(completed, symbol)
 
     trailing = CHART_TF_TRAILING[chart_tf]
     window_start = (disp.index[-1] - pd.Timedelta(minutes=trailing)
