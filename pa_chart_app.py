@@ -101,7 +101,7 @@ ALPACA_BASE = "https://data.alpaca.markets/v2"
 # Version stamp: the footer shows this tag plus a hash computed live from
 # the deployed file itself, so the page proves which build is running —
 # compare it with the hash named when the file was delivered.
-BUILD_TAG = "2026-11-18"
+BUILD_TAG = "2026-11-20-single-symbol-decision"
 
 
 def _build_hash() -> str:
@@ -3890,6 +3890,118 @@ def build_chart(df: pd.DataFrame, symbol: str, zones: list[dict],
     return fig
 
 
+# ---------------------------------------------------------------- Single-symbol decision lens
+# Research-only interpretation of Aziz (VWAP/ORB), Edwards-Magee
+# (trend and level breaks), Bulkowski (pattern failure), Weinstein
+# (trend stage), and Brooks (follow-through). NOT a calibrated forecast.
+def single_symbol_decision(df, pa, orng, patterns, zones):
+    """Causal, completed-bar setup assessment; no invented win probability."""
+    if df is None or len(df) < 22:
+        return {"bias": "INSUFFICIENT DATA", "state": "WAIT",
+                "reasons": ["Need at least 22 completed candles."],
+                "trigger": None, "stop": None, "target": None,
+                "rr": None, "rvol": None, "timestamp": None}
+    d = df
+    last = d.iloc[-1]
+    close = float(last["Close"])
+    e9, e21, vw = (float(last[k]) for k in ("EMA9", "EMA21", "VWAP"))
+    # Compare only to PRIOR bars to avoid current-bar breakout leakage.
+    lookback = d.iloc[-13:-1]
+    prior_hi = float(lookback["High"].max())
+    prior_lo = float(lookback["Low"].min())
+    # Median prior bar volume: a local participation proxy, not time-of-day RVOL.
+    base = float(d["Volume"].iloc[-21:-1].median())
+    rvol = float(last["Volume"]) / base if base > 0 else None
+    bull_trend = close > vw and e9 > e21 and close > e9
+    bear_trend = close < vw and e9 < e21 and close < e9
+    slope = float(d["EMA21"].iloc[-1] - d["EMA21"].iloc[-6])
+    bull_break = close > prior_hi and slope > 0
+    bear_break = close < prior_lo and slope < 0
+    bull_fail = (float(d["High"].iloc[-4:-1].max()) > prior_hi
+                 and close < prior_hi)
+    bear_fail = (float(d["Low"].iloc[-4:-1].min()) < prior_lo
+                 and close > prior_lo)
+    reasons = []
+    if bull_trend:
+        bias = "UP"
+        reasons.append("Above VWAP and EMA9; EMA9 above EMA21.")
+    elif bear_trend:
+        bias = "DOWN"
+        reasons.append("Below VWAP and EMA9; EMA9 below EMA21.")
+    else:
+        bias = "MIXED"
+        reasons.append("VWAP, price and EMA alignment disagree.")
+    if slope > 0:
+        reasons.append("EMA21 slope rising (intraday advancing-like phase).")
+    elif slope < 0:
+        reasons.append("EMA21 slope falling (intraday declining-like phase).")
+    if rvol is not None:
+        reasons.append(f"Last-bar volume {rvol:.2f}x prior-20 median (not time-of-day normalized).")
+    pattern = next((p for p in (patterns or [])
+                    if "CONFIRMED" in p.get("status", "")), None)
+    if pattern:
+        reasons.append(f"Detected {pattern['name']} — {pattern['status']}; pattern is unvalidated intraday.")
+    direction = 0
+    if bull_trend and bull_break and rvol is not None and rvol >= 1.2:
+        direction = 1
+        reasons.append("Closed above prior 12-bar high with volume expansion.")
+    elif bear_trend and bear_break and rvol is not None and rvol >= 1.2:
+        direction = -1
+        reasons.append("Closed below prior 12-bar low with volume expansion.")
+    else:
+        reasons.append("No completed-bar breakout with trend and volume confirmation.")
+    if direction == 1 and bull_fail:
+        direction = 0
+        reasons.append("Recent upper-level rejection: possible failed breakout.")
+    if direction == -1 and bear_fail:
+        direction = 0
+        reasons.append("Recent lower-level reclaim: possible failed breakdown.")
+    state = ("BULLISH SETUP — RESEARCH" if direction == 1 else
+             "BEARISH SETUP — RESEARCH" if direction == -1 else
+             "WAIT — NO CONFIRMED SETUP")
+    trigger = stop = target = rr = None
+    if direction:
+        trigger = prior_hi if direction > 0 else prior_lo
+        stop = min(float(d["Low"].iloc[-4:].min()), e21) if direction > 0 else max(float(d["High"].iloc[-4:].max()), e21)
+        risk = (close - stop) if direction > 0 else (stop - close)
+        # Explicitly hypothetical 2R objective; not a predicted price.
+        if risk > 0:
+            target = close + direction * 2.0 * risk
+            rr = 2.0
+        else:
+            state = "WAIT — INVALID RISK GEOMETRY"
+            trigger = stop = None
+    return {"bias": bias, "state": state, "reasons": reasons,
+            "trigger": trigger, "stop": stop, "target": target,
+            "rr": rr, "rvol": rvol,
+            "timestamp": d.index[-1]}
+
+
+def render_single_symbol_decision(read, symbol):
+    st.markdown(f"### {symbol} | Price-action decision lens")
+    a, b, c = st.columns(3)
+    a.metric("Directional context", read["bias"])
+    b.metric("Setup status", read["state"])
+    c.metric("Last-bar volume / prior median",
+             f"{read['rvol']:.2f}x" if read["rvol"] is not None else "—")
+    if read["timestamp"] is not None:
+        st.caption("Based on completed bar starting "
+                   + read["timestamp"].strftime("%Y-%m-%d %H:%M ET")
+                   + "; no prediction probability is implied.")
+    if read["trigger"] is not None:
+        st.markdown(
+            f"**Illustrative breakout level:** ${read['trigger']:,.2f}  "
+            f"· **Invalidation:** ${read['stop']:,.2f}  "
+            f"· **2R scenario (not forecast):** ${read['target']:,.2f}")
+    for reason in read["reasons"]:
+        st.write("• " + reason)
+    st.caption("Combines Aziz, Edwards–Magee, Bulkowski, Weinstein and Brooks "
+               "as qualitative intraday hypotheses. No historical expectancy "
+               "or calibrated direction probability has been established. "
+               "Volume ratio is not adjusted for time of day; use paper trading "
+               "and out-of-sample validation before risking capital.")
+
+
 # ---------------------------------------------------------------- UI
 st.set_page_config(page_title="Price-Action Charting", layout="wide")
 st.title("📐 Price-Action Charting")
@@ -4071,6 +4183,19 @@ def render():
     c4.metric("Weighted confluence",
               f"{wconf['score']} / 100" if wconf else "—",
               wconf["direction"] if wconf else None, delta_color="off")
+
+    # Decision lens uses completed candles only. Alpaca bar timestamps mark
+    # bar START, so the current interval must have ended before inclusion.
+    completed = disp
+    if not past_mode and sel_date == datetime.now(ET).date():
+        now_et = pd.Timestamp.now(tz=ET)
+        completed = disp[
+            disp.index + pd.Timedelta(minutes=minutes) <= now_et]
+    decision = single_symbol_decision(
+        completed, pa, orng, detect_chart_patterns(completed)
+        if len(completed) >= 22 else [], sr_zones(completed)
+        if len(completed) >= 22 else [])
+    render_single_symbol_decision(decision, symbol)
 
     trailing = CHART_TF_TRAILING[chart_tf]
     window_start = (disp.index[-1] - pd.Timedelta(minutes=trailing)
