@@ -4098,48 +4098,32 @@ def continuation_events(df: pd.DataFrame, orng: dict | None = None) -> pd.DataFr
 
 
 def render_continuation_engine(df: pd.DataFrame, symbol: str) -> None:
-    st.markdown(f"### {symbol} | Trend continuation & signal lifecycle")
+    """Compact, opt-in lifecycle history; no interactive grid dependency."""
     events = continuation_events(df)
     if events.empty:
-        st.info("No qualifying trend lifecycle events yet. This does not imply a sideways market.")
+        st.caption("Trend lifecycle: no qualifying events in completed bars.")
         return
     active = events.attrs.get("active")
     if active:
-        st.markdown(f"**Active hypothesis: {active['direction']} — {active['event']}** · "
-                    f"Fixed invalidation ${active['invalidation']:,.2f} · "
-                    f"{'WEAKENING' if active.get('weakening') else 'ACTIVE'}")
+        summary = (f"{active['direction']} — {active['event']} · "
+                   f"invalidation ${active['invalidation']:,.2f} · "
+                   f"{'WEAKENING' if active.get('weakening') else 'ACTIVE'}")
     else:
-        st.markdown("**Current state: NO ACTIVE HYPOTHESIS** — previous signals may have failed.")
-    st.caption("Events are stamped at completed candle close. Direction is a qualitative "
-               "trend hypothesis, not a calibrated price forecast. A DETECTED trend "
-               "does not itself confirm an entry; breakout volume is only required "
-               "for the fresh-breakout category.")
-    shown = events.tail(20).iloc[::-1].copy()
-    shown["bar_end"] = shown["bar_end"].dt.strftime("%Y-%m-%d %H:%M ET")
-    for col in ("close", "level", "invalidation", "volume_ratio"):
-        shown[col] = shown[col].round(2)
-    # Static Markdown table avoids the dynamically imported Streamlit
-    # dataframe/grid frontend module that fails in some browser deployments.
-    # Keep the causal event calculations and the original event columns.
-    from html import escape as _html_escape
-    display_cols = ["bar_end", "direction", "event", "status", "close",
-                    "level", "invalidation", "volume_ratio"]
-    st.caption("Recent lifecycle events (newest first)")
-    for _, rec in shown.iterrows():
-        timestamp = str(rec["bar_end"])
-        direction = str(rec["direction"])
-        event = str(rec["event"])
-        status = str(rec["status"])
-        details = (f"Close ${float(rec['close']):,.2f} · "
-                   f"Level ${float(rec['level']):,.2f} · "
-                   f"Invalidation ${float(rec['invalidation']):,.2f} · "
-                   f"Volume {float(rec['volume_ratio']):.2f}x")
-        st.markdown(f"**{_html_escape(timestamp)} — {_html_escape(direction)} "
-                    f"· {_html_escape(event)} · {_html_escape(status)}**")
-        st.caption(details + " · " + str(rec["reason"]))
-    st.caption("Replay is causal and includes no future-bar pivot confirmation. "
-               "Results have not been backtested for net profitability; this is "
-               "not an instruction to enter a trade.")
+        summary = "NO ACTIVE HYPOTHESIS"
+    st.markdown(f"**Trend lifecycle:** {summary}")
+    with st.expander("Historical lifecycle events (research)", expanded=False):
+        st.caption("Completed candles only. Qualitative hypotheses, not validated trades.")
+        # Keep history short and use plain text instead of a dynamically loaded grid.
+        from html import escape
+        for _, rec in events.tail(10).iloc[::-1].iterrows():
+            timestamp = rec['bar_end'].strftime('%Y-%m-%d %H:%M ET')
+            heading = (f"{timestamp} · {rec['direction']} · "
+                       f"{rec['event']} · {rec['status']}")
+            st.markdown(f"**{escape(heading)}**")
+            st.caption(f"Close ${rec['close']:,.2f} · Level ${rec['level']:,.2f} · "
+                       f"Invalidation ${rec['invalidation']:,.2f} · "
+                       f"Volume {rec['volume_ratio']:.2f}x · {rec['reason']}")
+        st.caption("These signals have not been validated for net profitability.")
 
 
 # ---------------------------------------------------------------- UI
@@ -4335,9 +4319,6 @@ def render():
         completed, pa, orng, detect_chart_patterns(completed)
         if len(completed) >= 22 else [], sr_zones(completed)
         if len(completed) >= 22 else [])
-    render_single_symbol_decision(decision, symbol)
-    render_continuation_engine(completed, symbol)
-
     trailing = CHART_TF_TRAILING[chart_tf]
     window_start = (disp.index[-1] - pd.Timedelta(minutes=trailing)
                     if trailing is not None else None)
@@ -4346,6 +4327,13 @@ def render():
                                 chart_patterns=chart_pats, vp=vp),
                     use_container_width=True,
                     key=f"pa_{symbol}_{tf_label}_{chart_tf.replace(' ', '_')}")
+
+    # Keep the price chart above research sections. This avoids the lifecycle
+    # event log pushing the chart several screens down.
+    with st.expander("Price-action decision & trend lifecycle", expanded=False):
+        render_single_symbol_decision(decision, symbol)
+        render_continuation_engine(completed, symbol)
+
 
     if show.get("volume_profile"):
         if vp is not None:
