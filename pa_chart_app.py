@@ -101,7 +101,7 @@ ALPACA_BASE = "https://data.alpaca.markets/v2"
 # Version stamp: the footer shows this tag plus a hash computed live from
 # the deployed file itself, so the page proves which build is running —
 # compare it with the hash named when the file was delivered.
-BUILD_TAG = "2026-11-21-continuation-v11"
+BUILD_TAG = "2026-11-23-lifecycle-static-v12"
 
 
 def _build_hash() -> str:
@@ -4118,7 +4118,25 @@ def render_continuation_engine(df: pd.DataFrame, symbol: str) -> None:
     shown["bar_end"] = shown["bar_end"].dt.strftime("%Y-%m-%d %H:%M ET")
     for col in ("close", "level", "invalidation", "volume_ratio"):
         shown[col] = shown[col].round(2)
-    st.dataframe(shown, use_container_width=True, hide_index=True)
+    # Static Markdown table avoids the dynamically imported Streamlit
+    # dataframe/grid frontend module that fails in some browser deployments.
+    # Keep the causal event calculations and the original event columns.
+    from html import escape as _html_escape
+    display_cols = ["bar_end", "direction", "event", "status", "close",
+                    "level", "invalidation", "volume_ratio"]
+    st.caption("Recent lifecycle events (newest first)")
+    for _, rec in shown.iterrows():
+        timestamp = str(rec["bar_end"])
+        direction = str(rec["direction"])
+        event = str(rec["event"])
+        status = str(rec["status"])
+        details = (f"Close ${float(rec['close']):,.2f} · "
+                   f"Level ${float(rec['level']):,.2f} · "
+                   f"Invalidation ${float(rec['invalidation']):,.2f} · "
+                   f"Volume {float(rec['volume_ratio']):.2f}x")
+        st.markdown(f"**{_html_escape(timestamp)} — {_html_escape(direction)} "
+                    f"· {_html_escape(event)} · {_html_escape(status)}**")
+        st.caption(details + " · " + str(rec["reason"]))
     st.caption("Replay is causal and includes no future-bar pivot confirmation. "
                "Results have not been backtested for net profitability; this is "
                "not an instruction to enter a trade.")
