@@ -101,7 +101,7 @@ ALPACA_BASE = "https://data.alpaca.markets/v2"
 # Version stamp: the footer shows this tag plus a hash computed live from
 # the deployed file itself, so the page proves which build is running —
 # compare it with the hash named when the file was delivered.
-BUILD_TAG = "2026-11-23-lifecycle-static-v12"
+BUILD_TAG = "2026-11-24-chart-first-latency-v14"
 
 
 def _build_hash() -> str:
@@ -3072,6 +3072,38 @@ def _schwager_rel_line(sym: str, chg: float, peer: str,
             f"({sym} {chg:+.2f}% vs {peer} {peer_chg:+.2f}%)")
 
 
+def early_session_chart(sym, bars, label="5-minute"):
+    """Chart-first fallback; never infer an unvalidated trading signal."""
+    if bars.empty:
+        st.info(f"{sym}: waiting for the first market candle.")
+        return
+    import plotly.graph_objects as go
+    fig = go.Figure(go.Candlestick(x=bars.index, open=bars.Open,
+        high=bars.High, low=bars.Low, close=bars.Close, name=sym))
+    fig.update_layout(height=500, xaxis_rangeslider_visible=False,
+        dragmode="zoom", title=f"{sym} — early session ({label} candles)")
+    st.plotly_chart(fig, use_container_width=True,
+        key=f"early_session_{sym}_{label.replace(' ', '_')}")
+    st.caption("Price chart is available; pattern classifications and longer-window reads are warming up.")
+
+
+def candle_latency_diagnostics(sym, raw, session):
+    now = pd.Timestamp.now(tz=ET)
+    latest = raw.index[-1] if not raw.empty else None
+    completed = session[session.index + pd.Timedelta(minutes=1) <= now]
+    last_complete = completed.index[-1] if not completed.empty else None
+    with st.expander(f"{sym} — Alpaca data timing diagnostics", expanded=False):
+        st.write(f"Current server time: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        st.write(f"Latest raw 1m bar start: {latest.strftime('%H:%M:%S %Z') if latest is not None else 'none'}")
+        st.write(f"Latest completed 1m bar end: {(last_complete + pd.Timedelta(minutes=1)).strftime('%H:%M:%S %Z') if last_complete is not None else 'none'}")
+        st.write(f"Session raw bars: {len(session)}; completed: {len(completed)}")
+        if last_complete is not None:
+            lag = (now - last_complete - pd.Timedelta(minutes=1)).total_seconds()
+            st.write(f"Age of latest completed bar: {lag:.0f} seconds")
+            if  lag > 120 and in_market_hours():
+                st.warning("Data is over two minutes behind the current time. Check Alpaca entitlement, API response and cache refresh.")
+
+
 def _brooks_symbol_data(sym: str):
     """1-min bars -> warmed 5-min frame for one Brooks symbol, plus
     prior-day levels, opening range and daily bars. Returns
@@ -3094,8 +3126,7 @@ def _brooks_symbol_data(sym: str):
     full5["EMA20"] = ema(full5["Close"], 20)
     disp = full5[full5.index.normalize() == pd.Timestamp(sel, tz=ET)]
     if len(disp) < 10:
-        return None, (f"Only the first few bars of the {sym} session "
-                      "so far — the read builds as bars arrive.")
+        return {"early": True, "disp": disp, "raw": df1, "session": df1[df1.index.date == sel]}, None
     pa = prior_day_levels(df1)
     today_df = df1[df1.index.date == sel]
     orng = opening_range(today_df)
@@ -3131,6 +3162,9 @@ def render_brooks():
         if err:
             per_sym[sym] = {"error": err}
             continue
+        if data.get("early"):
+            per_sym[sym] = data
+            continue
         disp = data["disp"]
         pa = data["pa"]
         orng = data["orng"]
@@ -3163,6 +3197,10 @@ def render_brooks():
             if "error" in info:
                 st.info(info["error"])
                 continue
+            if info.get("early"):
+                early_session_chart(sym, info["disp"], "5-minute")
+                candle_latency_diagnostics(sym, info["raw"], info["session"])
+                continue
             peer = BROOKS_SYMBOLS[1] if sym == BROOKS_SYMBOLS[0] \
                 else BROOKS_SYMBOLS[0]
             peer_chg = per_sym[peer].get("chg") \
@@ -3174,6 +3212,7 @@ def render_brooks():
             schw = info["schw"]
             last = info["last"]
             chg = info["chg"]
+            candle_latency_diagnostics(sym, fetch_bars_1m(sym, _bucket(live, int(refresh_secs)), end=view_date.isoformat() if past_mode else ""), fetch_bars_1m(sym, _bucket(live, int(refresh_secs)), end=view_date.isoformat() if past_mode else "").loc[lambda d: d.index.date == info["disp"].index[-1].date()])
             st.metric(sym, f"${float(last['Close']):,.2f}",
                       f"{chg:+.2f}% vs prior close")
             st.plotly_chart(
@@ -4098,32 +4137,48 @@ def continuation_events(df: pd.DataFrame, orng: dict | None = None) -> pd.DataFr
 
 
 def render_continuation_engine(df: pd.DataFrame, symbol: str) -> None:
-    """Compact, opt-in lifecycle history; no interactive grid dependency."""
+    st.markdown(f"### {symbol} | Trend continuation & signal lifecycle")
     events = continuation_events(df)
     if events.empty:
-        st.caption("Trend lifecycle: no qualifying events in completed bars.")
+        st.info("No qualifying trend lifecycle events yet. This does not imply a sideways market.")
         return
     active = events.attrs.get("active")
     if active:
-        summary = (f"{active['direction']} — {active['event']} · "
-                   f"invalidation ${active['invalidation']:,.2f} · "
-                   f"{'WEAKENING' if active.get('weakening') else 'ACTIVE'}")
+        st.markdown(f"**Active hypothesis: {active['direction']} — {active['event']}** · "
+                    f"Fixed invalidation ${active['invalidation']:,.2f} · "
+                    f"{'WEAKENING' if active.get('weakening') else 'ACTIVE'}")
     else:
-        summary = "NO ACTIVE HYPOTHESIS"
-    st.markdown(f"**Trend lifecycle:** {summary}")
-    with st.expander("Historical lifecycle events (research)", expanded=False):
-        st.caption("Completed candles only. Qualitative hypotheses, not validated trades.")
-        # Keep history short and use plain text instead of a dynamically loaded grid.
-        from html import escape
-        for _, rec in events.tail(10).iloc[::-1].iterrows():
-            timestamp = rec['bar_end'].strftime('%Y-%m-%d %H:%M ET')
-            heading = (f"{timestamp} · {rec['direction']} · "
-                       f"{rec['event']} · {rec['status']}")
-            st.markdown(f"**{escape(heading)}**")
-            st.caption(f"Close ${rec['close']:,.2f} · Level ${rec['level']:,.2f} · "
-                       f"Invalidation ${rec['invalidation']:,.2f} · "
-                       f"Volume {rec['volume_ratio']:.2f}x · {rec['reason']}")
-        st.caption("These signals have not been validated for net profitability.")
+        st.markdown("**Current state: NO ACTIVE HYPOTHESIS** — previous signals may have failed.")
+    st.caption("Events are stamped at completed candle close. Direction is a qualitative "
+               "trend hypothesis, not a calibrated price forecast. A DETECTED trend "
+               "does not itself confirm an entry; breakout volume is only required "
+               "for the fresh-breakout category.")
+    shown = events.tail(20).iloc[::-1].copy()
+    shown["bar_end"] = shown["bar_end"].dt.strftime("%Y-%m-%d %H:%M ET")
+    for col in ("close", "level", "invalidation", "volume_ratio"):
+        shown[col] = shown[col].round(2)
+    # Static Markdown table avoids the dynamically imported Streamlit
+    # dataframe/grid frontend module that fails in some browser deployments.
+    # Keep the causal event calculations and the original event columns.
+    from html import escape as _html_escape
+    display_cols = ["bar_end", "direction", "event", "status", "close",
+                    "level", "invalidation", "volume_ratio"]
+    st.caption("Recent lifecycle events (newest first)")
+    for _, rec in shown.iterrows():
+        timestamp = str(rec["bar_end"])
+        direction = str(rec["direction"])
+        event = str(rec["event"])
+        status = str(rec["status"])
+        details = (f"Close ${float(rec['close']):,.2f} · "
+                   f"Level ${float(rec['level']):,.2f} · "
+                   f"Invalidation ${float(rec['invalidation']):,.2f} · "
+                   f"Volume {float(rec['volume_ratio']):.2f}x")
+        st.markdown(f"**{_html_escape(timestamp)} — {_html_escape(direction)} "
+                    f"· {_html_escape(event)} · {_html_escape(status)}**")
+        st.caption(details + " · " + str(rec["reason"]))
+    st.caption("Replay is causal and includes no future-bar pivot confirmation. "
+               "Results have not been backtested for net profitability; this is "
+               "not an instruction to enter a trade.")
 
 
 # ---------------------------------------------------------------- UI
@@ -4242,8 +4297,8 @@ def render():
     disp = full_disp[full_disp.index.normalize()
                      == pd.Timestamp(sel_date, tz=ET)]
     if len(disp) < 10:
-        st.info("Only the first few bars of the session so far — the chart "
-                "builds as bars arrive.")
+        early_session_chart(symbol, disp, f"{minutes}-minute")
+        candle_latency_diagnostics(symbol, df1, df)
         return
 
     pa = prior_day_levels(df1)
@@ -4319,6 +4374,9 @@ def render():
         completed, pa, orng, detect_chart_patterns(completed)
         if len(completed) >= 22 else [], sr_zones(completed)
         if len(completed) >= 22 else [])
+    render_single_symbol_decision(decision, symbol)
+    render_continuation_engine(completed, symbol)
+
     trailing = CHART_TF_TRAILING[chart_tf]
     window_start = (disp.index[-1] - pd.Timedelta(minutes=trailing)
                     if trailing is not None else None)
@@ -4327,13 +4385,6 @@ def render():
                                 chart_patterns=chart_pats, vp=vp),
                     use_container_width=True,
                     key=f"pa_{symbol}_{tf_label}_{chart_tf.replace(' ', '_')}")
-
-    # Keep the price chart above research sections. This avoids the lifecycle
-    # event log pushing the chart several screens down.
-    with st.expander("Price-action decision & trend lifecycle", expanded=False):
-        render_single_symbol_decision(decision, symbol)
-        render_continuation_engine(completed, symbol)
-
 
     if show.get("volume_profile"):
         if vp is not None:
