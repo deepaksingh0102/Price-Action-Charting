@@ -101,7 +101,7 @@ ALPACA_BASE = "https://data.alpaca.markets/v2"
 # Version stamp: the footer shows this tag plus a hash computed live from
 # the deployed file itself, so the page proves which build is running —
 # compare it with the hash named when the file was delivered.
-BUILD_TAG = "2026-11-24-chart-first-latency-v14"
+BUILD_TAG = "2026-11-24-chart-first-clean-v15"
 
 
 def _build_hash() -> str:
@@ -3114,7 +3114,7 @@ def _brooks_symbol_data(sym: str):
             end=view_date.isoformat() if past_mode else "")
     except Exception as e:
         return None, f"Could not load bars for {sym}: {e}"
-    if df1.empty or len(df1) < 60:
+    if df1.empty:
         return None, f"Not enough intraday data for {sym} yet."
     dates = sorted(set(df1.index.date))
     if past_mode and view_date not in dates:
@@ -3125,7 +3125,7 @@ def _brooks_symbol_data(sym: str):
     full5 = add_indicators(resample(df1, BROOKS_BAR_MIN))
     full5["EMA20"] = ema(full5["Close"], 20)
     disp = full5[full5.index.normalize() == pd.Timestamp(sel, tz=ET)]
-    if len(disp) < 10:
+    if len(disp) < 1:
         return {"early": True, "disp": disp, "raw": df1, "session": df1[df1.index.date == sel]}, None
     pa = prior_day_levels(df1)
     today_df = df1[df1.index.date == sel]
@@ -3137,7 +3137,7 @@ def _brooks_symbol_data(sym: str):
             end=view_date.isoformat() if past_mode else "")
     except Exception:
         daily = None
-    return {"symbol": sym, "sel_date": sel, "disp": disp, "pa": pa,
+    return {"symbol": sym, "sel_date": sel, "disp": disp, "raw": df1, "session": today_df, "pa": pa,
             "orng": orng, "daily": daily}, None
 
 
@@ -3176,6 +3176,9 @@ def render_brooks():
         level_vals = ([pa["PDH"], pa["PDC"], pa["PDL"]] if pa else []) \
             + [z["center"] for z in zones] \
             + ([orng["high"], orng["low"]] if orng else [])
+        if len(disp) < 10:
+            per_sym[sym] = {"early": True, "disp": disp, "raw": data["raw"], "session": data["session"]}
+            continue
         read = brooks_day_read(disp, pa, data["daily"], orng,
                                data["sel_date"], lines=lines)
         schw = schwager_day_reads(disp, pa, orng, read, chart_pats,
@@ -4273,7 +4276,7 @@ def render():
     except Exception as e:
         st.error(f"Could not load bars for {symbol}: {e}")
         return
-    if df1.empty or len(df1) < 60:
+    if df1.empty:
         st.info(f"Not enough intraday data for {symbol} yet.")
         return
     dates = sorted(set(df1.index.date))
@@ -4296,7 +4299,7 @@ def render():
     full_disp = add_indicators(resample(df1, minutes))
     disp = full_disp[full_disp.index.normalize()
                      == pd.Timestamp(sel_date, tz=ET)]
-    if len(disp) < 10:
+    if len(disp) < 1:
         early_session_chart(symbol, disp, f"{minutes}-minute")
         candle_latency_diagnostics(symbol, df1, df)
         return
@@ -4370,12 +4373,7 @@ def render():
         now_et = pd.Timestamp.now(tz=ET)
         completed = disp[
             disp.index + pd.Timedelta(minutes=minutes) <= now_et]
-    decision = single_symbol_decision(
-        completed, pa, orng, detect_chart_patterns(completed)
-        if len(completed) >= 22 else [], sr_zones(completed)
-        if len(completed) >= 22 else [])
-    render_single_symbol_decision(decision, symbol)
-    render_continuation_engine(completed, symbol)
+    # Previously discarded decision-lens and lifecycle panels stay hidden.
 
     trailing = CHART_TF_TRAILING[chart_tf]
     window_start = (disp.index[-1] - pd.Timedelta(minutes=trailing)
