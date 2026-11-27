@@ -34,9 +34,9 @@ book (@FORRNEERO), drawn on the chart for any US stock:
     and the book's reliability claims do not transfer to it. The
     Template is daily context only — it never changes the weighted
     confluence score.
-  * BROOKS — SPY & QQQ TAB (Al Brooks, "Trading Price Action Trends",
-    Ch. 1-26) — SPY and QQQ in tabs, like the stock-analyzer's
-    SPY/QQQ tabs, one tab per symbol on 5-minute bars with the
+  * BROOKS — SINGLE-SYMBOL VIEW (Al Brooks, "Trading Price Action Trends",
+    Ch. 1-26) — the selected ticker, replacing the old
+    SPY/QQQ tabs, on 5-minute bars with the
     book's intraday read on each: a Buy / Sell / Hold verdict with a
     confirmation percentage (the analyzer's High 75 / Moderate 60 /
     Low 45 scale — confirmation counts how much of the read lines up
@@ -101,7 +101,7 @@ ALPACA_BASE = "https://data.alpaca.markets/v2"
 # Version stamp: the footer shows this tag plus a hash computed live from
 # the deployed file itself, so the page proves which build is running —
 # compare it with the hash named when the file was delivered.
-BUILD_TAG = "2026-11-24-chart-first-clean-v15"
+BUILD_TAG = "2026-11-27-single-symbol-brooks-v16"
 
 
 def _build_hash() -> str:
@@ -2073,7 +2073,7 @@ def weighted_confluence(df: pd.DataFrame, zones: list[dict],
 
 
 # ---------------------------------------------------------------- Brooks — SPY & QQQ tab
-BROOKS_VIEW = "SPY & QQQ — Brooks (5-min)"
+BROOKS_VIEW = "Single symbol — Brooks (5-min)"
 BROOKS_SYMBOLS = ("SPY", "QQQ")
 BROOKS_BAR_MIN = 5
 BROOKS_ADR_DAYS = 20  # sessions for the average daily range
@@ -3142,231 +3142,196 @@ def _brooks_symbol_data(sym: str):
 
 
 def render_brooks():
-    """SPY & QQQ in tabs, like the stock-analyzer's SPY/QQQ tabs — one
-    tab per symbol on 5-minute bars, each with the full chart (zones,
-    trendlines, patterns, volume profile) and the Brooks read
-    underneath: day type, always-in, spike/channel phase, High/Low
-    leg count, measured moves, strength checklist, plus the Schwager
-    Part Four and Aziz sections (verdict invalidation, position size,
-    reward:risk, failed breakouts, Red-to-Green trap, wide-range
-    reversal bar, gap status, consolidation position, break of the
-    prior day's high/low, reversal setup, SPY vs QQQ relative
-    strength). No PCR, no weighted confluence
-    here — those live on the single-symbol tab. Both symbols are
-    gathered first so each panel can quote the other's day change
-    (Schwager rule 71)."""
+    """Brooks five-minute chart and analysis for the selected ticker only."""
+    sym = symbol
     show_b = dict(show)
-    per_sym = {}
-    for sym in BROOKS_SYMBOLS:
-        data, err = _brooks_symbol_data(sym)
-        if err:
-            per_sym[sym] = {"error": err}
-            continue
-        if data.get("early"):
-            per_sym[sym] = data
-            continue
-        disp = data["disp"]
-        pa = data["pa"]
-        orng = data["orng"]
-        zones = sr_zones(disp)
-        lines = trendlines(disp)
-        vp = session_volume_profile(disp)
-        chart_pats = detect_chart_patterns(disp)
-        pats = candle_patterns(disp)
-        level_vals = ([pa["PDH"], pa["PDC"], pa["PDL"]] if pa else []) \
-            + [z["center"] for z in zones] \
-            + ([orng["high"], orng["low"]] if orng else [])
-        if len(disp) < 10:
-            per_sym[sym] = {"early": True, "disp": disp, "raw": data["raw"], "session": data["session"]}
-            continue
-        read = brooks_day_read(disp, pa, data["daily"], orng,
-                               data["sel_date"], lines=lines)
-        schw = schwager_day_reads(disp, pa, orng, read, chart_pats,
-                                  candle_pats=pats,
-                                  levels=level_vals)
-        last = disp.iloc[-1]
-        prev_close = pa["PDC"] if pa else float(disp["Close"].iloc[0])
-        chg = (float(last["Close"]) / prev_close - 1) * 100 \
-            if prev_close else 0.0
-        per_sym[sym] = {"disp": disp, "pa": pa, "orng": orng,
-                        "zones": zones, "lines": lines, "vp": vp,
-                        "chart_pats": chart_pats, "pats": pats,
-                        "level_vals": level_vals, "read": read,
-                        "schw": schw, "last": last, "chg": chg}
-    tabs = st.tabs([f"{sym} — Brooks" for sym in BROOKS_SYMBOLS])
-    for tab, sym in zip(tabs, BROOKS_SYMBOLS):
-        with tab:
-            info = per_sym[sym]
-            if "error" in info:
-                st.info(info["error"])
-                continue
-            if info.get("early"):
-                early_session_chart(sym, info["disp"], "5-minute")
-                candle_latency_diagnostics(sym, info["raw"], info["session"])
-                continue
-            peer = BROOKS_SYMBOLS[1] if sym == BROOKS_SYMBOLS[0] \
-                else BROOKS_SYMBOLS[0]
-            peer_chg = per_sym[peer].get("chg") \
-                if "error" not in per_sym[peer] else None
-            disp = info["disp"]
-            pa = info["pa"]
-            orng = info["orng"]
-            read = info["read"]
-            schw = info["schw"]
-            last = info["last"]
-            chg = info["chg"]
-            candle_latency_diagnostics(sym, fetch_bars_1m(sym, _bucket(live, int(refresh_secs)), end=view_date.isoformat() if past_mode else ""), fetch_bars_1m(sym, _bucket(live, int(refresh_secs)), end=view_date.isoformat() if past_mode else "").loc[lambda d: d.index.date == info["disp"].index[-1].date()])
-            st.metric(sym, f"${float(last['Close']):,.2f}",
-                      f"{chg:+.2f}% vs prior close")
-            st.plotly_chart(
-                build_chart(disp, sym, info["zones"], info["lines"],
-                            info["pats"], info["level_vals"],
-                            pa, orng, show_b, window_start=None,
-                            chart_patterns=info["chart_pats"], vp=info["vp"],
-                            brooks_overlay={"read": read, "schw": schw}),
-                use_container_width=True, key=f"brooks_{sym}_5min")
-            v = read["verdict"]
-            vcolor = {"Buy": "green", "Sell": "red"}.get(v, "orange")
-            st.markdown(
-                f"**{sym} — Brooks read: :{vcolor}[{v.upper()}] — "
-                f"{read['confirmation']}% confirmation "
-                f"({read['conviction']})**")
-            st.caption(read["verdict_reason"])
-            rows = [
-                f"- **Day type:** {read['day_type']}",
-                f"- **Always-in:** {read['always_label']}",
-                f"- **Phase:** {read['phase']}"
-                + (f" — spike {read['spike']['bars']} bars, "
-                   f"${read['spike']['height']:.2f} from the open"
-                   if read["spike"] else ""),
-                f"- **Pullback count:** {read['leg_label']}",
-            ]
-            if read["measured_moves"]:
-                rows.append("- **Measured moves:** " + " · ".join(
-                    f"{label} ${px:,.2f}"
-                    for label, px in read["measured_moves"]))
-            if read["or_ratio"] is not None:
-                rows.append(
-                    f"- **Opening range:** {read['or_ratio']:.0%} of the "
-                    f"{BROOKS_ADR_DAYS}-day avg day range "
-                    f"(${read['adr']:,.2f})")
-            st.markdown("\n".join(rows))
-            if read["strength"]:
-                met = sum(1 for _, m in read["strength"] if m)
-                slines = [f"**Strength checklist (Ch. 19) — "
-                          f"{met}/{len(read['strength'])}**"]
-                for label, m in read["strength"]:
-                    slines.append(f"- {'✓' if m else '✗'} {label}")
-                st.markdown("\n".join(slines))
-            # Schwager Part Four — only lines that apply are shown.
-            glines = []
-            if read["invalidation"] is not None:
-                glines.append(
-                    f"- **Invalidation:** a 5-min close "
-                    f"{'below' if v == 'Buy' else 'above'} "
-                    f"${read['invalidation']:,.2f} "
-                    f"({read['invalidation_label']}) undoes this {v}.")
-            if schw["size"]:
-                s = schw["size"]
-                glines.append(
-                    f"- **Size it:** entry ${s['entry']:,.2f}, stop "
-                    f"${s['stop']:,.2f}, risk "
-                    f"${s['risk_per_share']:.2f}/share → {s['shares']} "
-                    "shares at 1% of $100k.")
-            if schw["reward_risk"]:
-                rr = schw["reward_risk"]
-                glines.append(
-                    f"- **Reward:risk {_fmt_rr(rr['ratio'])}** — target "
-                    f"${rr['target']:,.2f} ({rr['target_label']}) vs "
-                    f"stop ${read['invalidation']:,.2f}"
-                    + (" — below Aziz's 2:1 minimum"
-                       if not rr["meets"] else ""))
-            for fb in schw["failed"][:1]:
-                lean = "bearish" if fb["kind"] == "Bull trap" \
-                    else "bullish"
-                conflict = ""
-                if (fb["kind"] == "Bull trap" and v == "Buy") or \
-                        (fb["kind"] == "Bear trap" and v == "Sell"):
-                    conflict = f" — conflicts with the {v} verdict"
-                glines.append(
-                    f"- **Failed breakout:** {fb['kind']} — broke out "
-                    f"of the {fb['source'].lower()} to "
-                    f"${fb['extreme']:,.2f}, closed back inside at "
-                    f"{fb['time']}; lean flips {lean}, stop "
-                    f"{'above' if fb['kind'] == 'Bull trap' else 'below'} "
-                    f"${fb['extreme']:,.2f}{conflict}.")
-            if schw["red_green"]:
-                rg = schw["red_green"]
-                conflict = ""
-                if (rg["direction"] == "short" and v == "Buy") or \
-                        (rg["direction"] == "long" and v == "Sell"):
-                    conflict = f" — conflicts with the {v} verdict"
-                if rg["direction"] == "short":
-                    glines.append(
-                        f"- **{rg['kind']}:** rallied above the prior "
-                        f"close to ${rg['extreme']:,.2f}, closed back "
-                        f"below at {rg['time']}; lean flips bearish, "
-                        f"stop above ${rg['extreme']:,.2f}{conflict}.")
-                else:
-                    glines.append(
-                        f"- **{rg['kind']}:** dipped below the prior "
-                        f"close to ${rg['extreme']:,.2f}, closed back "
-                        f"above at {rg['time']}; lean flips bullish, "
-                        f"stop below ${rg['extreme']:,.2f}{conflict}.")
-            if schw["wide_reversal"]:
-                wr = schw["wide_reversal"]
-                glines.append(
-                    f"- **Wide-range reversal bar:** {wr['time']} — "
-                    f"range {wr['multiple']:.1f}× the session median "
-                    f"bar range, closed {wr['direction']} against the "
-                    "trend (Rule 65).")
-            if schw["gap"]:
-                g = schw["gap"]
-                glines.append(
-                    f"- **Gap:** {g['pct']:+.1f}% open — "
-                    f"{'filled at ' + g['fill_time'] if g['filled'] else 'still open'}.")
-            for e in schw["hod_lod"]:
-                if e["kind"] == "High of day":
-                    glines.append(
-                        f"- **Break of high of day:** closed above the "
-                        f"prior day's high (${e['level']:,.2f}) at "
-                        f"{e['time']}.")
-                else:
-                    glines.append(
-                        f"- **Break of low of day:** closed below the "
-                        f"prior day's low (${e['level']:,.2f}) at "
-                        f"{e['time']}.")
-            if schw["consol"]:
-                glines.append(
-                    f"- **Consolidation:** the range sits "
-                    f"{schw['consol']['label']} (Rule 49).")
-            if schw["reversal_setup"]:
-                rs = schw["reversal_setup"]
-                glines.append(
-                    f"- **Reversal setup:** {rs['name']} at "
-                    f"${rs['price']:,.2f} after a {rs['run']}-bar "
-                    f"{rs['direction']} run (Aziz — ungraded, not a "
-                    "signal).")
-            rel = _schwager_rel_line(sym, chg, peer, peer_chg)
-            if rel:
-                glines.append(f"- **vs {peer}:** {rel} (Rule 71).")
-            if glines:
-                st.markdown(
-                    "**Schwager & Aziz — day-trading adds**\n"
-                    + "\n".join(glines))
-            st.caption(
-                f"{read['day_evidence']} — Brooks, Trading Price "
-                "Action Trends, on 5-min bars. Confirmation counts how "
-                "much of the read lines up behind the direction "
-                "(strength checklist, always-in votes, day type) — it "
-                "is not a win probability, and the book's reliability "
-                "claims do not transfer to a single day. Schwager's "
-                "own Rule 44 warns intraday decisions are almost "
-                "always losers — this is a read of location and "
-                "permission, not a forecast.")
+    data, err = _brooks_symbol_data(sym)
+    if err:
+        st.info(err)
+        return
+    if data.get("early"):
+        early_session_chart(sym, data["disp"], "5-minute")
+        candle_latency_diagnostics(sym, data["raw"], data["session"])
+        return
+    disp = data["disp"]
+    if len(disp) < 10:
+        early_session_chart(sym, disp, "5-minute")
+        candle_latency_diagnostics(sym, data["raw"], data["session"])
+        return
+    pa = data["pa"]
+    orng = data["orng"]
+    zones = sr_zones(disp)
+    lines = trendlines(disp)
+    vp = session_volume_profile(disp)
+    chart_pats = detect_chart_patterns(disp)
+    pats = candle_patterns(disp)
+    level_vals = ([pa["PDH"], pa["PDC"], pa["PDL"]] if pa else []) \
+        + [z["center"] for z in zones] \
+        + ([orng["high"], orng["low"]] if orng else [])
+    read = brooks_day_read(disp, pa, data["daily"], orng,
+                           data["sel_date"], lines=lines)
+    schw = schwager_day_reads(disp, pa, orng, read, chart_pats,
+                              candle_pats=pats, levels=level_vals)
+    last = disp.iloc[-1]
+    prev_close = pa["PDC"] if pa else float(disp["Close"].iloc[0])
+    chg = (float(last["Close"]) / prev_close - 1) * 100 if prev_close else 0.0
+    info = {"zones": zones, "lines": lines, "vp": vp,
+            "chart_pats": chart_pats, "pats": pats,
+            "level_vals": level_vals}
+    peer = "SPY" if sym != "SPY" else "QQQ"
+    peer_chg = None  # Do not fetch another ticker in single-symbol mode.
+    candle_latency_diagnostics(sym, data["raw"], data["session"])
+    st.metric(sym, f"${float(last['Close']):,.2f}",
+              f"{chg:+.2f}% vs prior close")
+    st.plotly_chart(
+        build_chart(disp, sym, info["zones"], info["lines"],
+                    info["pats"], info["level_vals"],
+                    pa, orng, show_b, window_start=None,
+                    chart_patterns=info["chart_pats"], vp=info["vp"],
+                    brooks_overlay={"read": read, "schw": schw}),
+        use_container_width=True, key=f"brooks_{sym}_5min")
+    v = read["verdict"]
+    vcolor = {"Buy": "green", "Sell": "red"}.get(v, "orange")
+    st.markdown(
+        f"**{sym} — Brooks read: :{vcolor}[{v.upper()}] — "
+        f"{read['confirmation']}% confirmation "
+        f"({read['conviction']})**")
+    st.caption(read["verdict_reason"])
+    rows = [
+        f"- **Day type:** {read['day_type']}",
+        f"- **Always-in:** {read['always_label']}",
+        f"- **Phase:** {read['phase']}"
+        + (f" — spike {read['spike']['bars']} bars, "
+           f"${read['spike']['height']:.2f} from the open"
+           if read["spike"] else ""),
+        f"- **Pullback count:** {read['leg_label']}",
+    ]
+    if read["measured_moves"]:
+        rows.append("- **Measured moves:** " + " · ".join(
+            f"{label} ${px:,.2f}"
+            for label, px in read["measured_moves"]))
+    if read["or_ratio"] is not None:
+        rows.append(
+            f"- **Opening range:** {read['or_ratio']:.0%} of the "
+            f"{BROOKS_ADR_DAYS}-day avg day range "
+            f"(${read['adr']:,.2f})")
+    st.markdown("\n".join(rows))
+    if read["strength"]:
+        met = sum(1 for _, m in read["strength"] if m)
+        slines = [f"**Strength checklist (Ch. 19) — "
+                  f"{met}/{len(read['strength'])}**"]
+        for label, m in read["strength"]:
+            slines.append(f"- {'✓' if m else '✗'} {label}")
+        st.markdown("\n".join(slines))
+    # Schwager Part Four — only lines that apply are shown.
+    glines = []
+    if read["invalidation"] is not None:
+        glines.append(
+            f"- **Invalidation:** a 5-min close "
+            f"{'below' if v == 'Buy' else 'above'} "
+            f"${read['invalidation']:,.2f} "
+            f"({read['invalidation_label']}) undoes this {v}.")
+    if schw["size"]:
+        s = schw["size"]
+        glines.append(
+            f"- **Size it:** entry ${s['entry']:,.2f}, stop "
+            f"${s['stop']:,.2f}, risk "
+            f"${s['risk_per_share']:.2f}/share → {s['shares']} "
+            "shares at 1% of $100k.")
+    if schw["reward_risk"]:
+        rr = schw["reward_risk"]
+        glines.append(
+            f"- **Reward:risk {_fmt_rr(rr['ratio'])}** — target "
+            f"${rr['target']:,.2f} ({rr['target_label']}) vs "
+            f"stop ${read['invalidation']:,.2f}"
+            + (" — below Aziz's 2:1 minimum"
+               if not rr["meets"] else ""))
+    for fb in schw["failed"][:1]:
+        lean = "bearish" if fb["kind"] == "Bull trap" \
+            else "bullish"
+        conflict = ""
+        if (fb["kind"] == "Bull trap" and v == "Buy") or \
+                (fb["kind"] == "Bear trap" and v == "Sell"):
+            conflict = f" — conflicts with the {v} verdict"
+        glines.append(
+            f"- **Failed breakout:** {fb['kind']} — broke out "
+            f"of the {fb['source'].lower()} to "
+            f"${fb['extreme']:,.2f}, closed back inside at "
+            f"{fb['time']}; lean flips {lean}, stop "
+            f"{'above' if fb['kind'] == 'Bull trap' else 'below'} "
+            f"${fb['extreme']:,.2f}{conflict}.")
+    if schw["red_green"]:
+        rg = schw["red_green"]
+        conflict = ""
+        if (rg["direction"] == "short" and v == "Buy") or \
+                (rg["direction"] == "long" and v == "Sell"):
+            conflict = f" — conflicts with the {v} verdict"
+        if rg["direction"] == "short":
+            glines.append(
+                f"- **{rg['kind']}:** rallied above the prior "
+                f"close to ${rg['extreme']:,.2f}, closed back "
+                f"below at {rg['time']}; lean flips bearish, "
+                f"stop above ${rg['extreme']:,.2f}{conflict}.")
+        else:
+            glines.append(
+                f"- **{rg['kind']}:** dipped below the prior "
+                f"close to ${rg['extreme']:,.2f}, closed back "
+                f"above at {rg['time']}; lean flips bullish, "
+                f"stop below ${rg['extreme']:,.2f}{conflict}.")
+    if schw["wide_reversal"]:
+        wr = schw["wide_reversal"]
+        glines.append(
+            f"- **Wide-range reversal bar:** {wr['time']} — "
+            f"range {wr['multiple']:.1f}× the session median "
+            f"bar range, closed {wr['direction']} against the "
+            "trend (Rule 65).")
+    if schw["gap"]:
+        g = schw["gap"]
+        glines.append(
+            f"- **Gap:** {g['pct']:+.1f}% open — "
+            f"{'filled at ' + g['fill_time'] if g['filled'] else 'still open'}.")
+    for e in schw["hod_lod"]:
+        if e["kind"] == "High of day":
+            glines.append(
+                f"- **Break of high of day:** closed above the "
+                f"prior day's high (${e['level']:,.2f}) at "
+                f"{e['time']}.")
+        else:
+            glines.append(
+                f"- **Break of low of day:** closed below the "
+                f"prior day's low (${e['level']:,.2f}) at "
+                f"{e['time']}.")
+    if schw["consol"]:
+        glines.append(
+            f"- **Consolidation:** the range sits "
+            f"{schw['consol']['label']} (Rule 49).")
+    if schw["reversal_setup"]:
+        rs = schw["reversal_setup"]
+        glines.append(
+            f"- **Reversal setup:** {rs['name']} at "
+            f"${rs['price']:,.2f} after a {rs['run']}-bar "
+            f"{rs['direction']} run (Aziz — ungraded, not a "
+            "signal).")
+    rel = _schwager_rel_line(sym, chg, peer, peer_chg)
+    if rel:
+        glines.append(f"- **vs {peer}:** {rel} (Rule 71).")
+    if glines:
+        st.markdown(
+            "**Schwager & Aziz — day-trading adds**\n"
+            + "\n".join(glines))
+    st.caption(
+        f"{read['day_evidence']} — Brooks, Trading Price "
+        "Action Trends, on 5-min bars. Confirmation counts how "
+        "much of the read lines up behind the direction "
+        "(strength checklist, always-in votes, day type) — it "
+        "is not a win probability, and the book's reliability "
+        "claims do not transfer to a single day. Schwager's "
+        "own Rule 44 warns intraday decisions are almost "
+        "always losers — this is a read of location and "
+        "permission, not a forecast.")
     st.caption(
         f"Alpaca {str(_feed).upper()} · 5-min bars, full session · "
-        f"SPY + QQQ · updated {datetime.now(ET).strftime('%H:%M:%S')} "
+        f"{sym} · updated {datetime.now(ET).strftime('%H:%M:%S')} "
         f"ET · build {BUILD_TAG} · {BUILD_HASH}")
 
 
@@ -4206,8 +4171,8 @@ with st.sidebar:
         ["Single symbol", BROOKS_VIEW],
         index=0,
         help="Single symbol is the full charting app for one ticker. "
-             "SPY & QQQ — Brooks shows both indexes side by side on "
-             "5-minute bars with the Brooks day read on each.")
+             "Single symbol — Brooks analyzes the selected ticker on "
+             "5-minute bars with the Brooks day read.")
     st.header("Chart")
     symbol = st.text_input("Stock symbol", value="AAPL").strip().upper() or "AAPL"
     _today_et = datetime.now(ET).date()
@@ -4541,7 +4506,7 @@ with st.expander("How to read this chart"):
         "the average day. The book's patterns take weeks on daily "
         "charts; the intraday VCP is a miniature of the geometry, not "
         "of the book's reliability.\n"
-        "- **Brooks tab (SPY & QQQ)** — the 5-minute read: a Buy / Sell / "
+        "- **Brooks single-symbol view** — the 5-minute read: a Buy / Sell / "
         "Hold verdict with a confirmation percentage (High 75 / Moderate "
         "60 / Low 45, the analyzer's scale — it counts how much of the "
         "read lines up behind the direction, not a win probability), the "
